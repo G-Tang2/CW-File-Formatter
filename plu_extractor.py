@@ -1,12 +1,17 @@
 """PLU Extractor
 
-Reads an .xlsx or .csv file, keeps only the values of the 'PLU' column,
-adds a column filled with 1 to its right, and writes the result as a CSV
-with no header row.
+Reads an .xlsx or .csv file and writes a two-column CSV (PLU, QTY) with no
+header row.
+
+  - No header row (default): column 1 is the PLU and column 2 is the QTY.
+    A missing or blank QTY becomes the QTY entered in the window (default 1).
+  - Header row: keeps only the values of the 'PLU' column and sets every QTY
+    to the QTY entered in the window (default 1).
 
 Usage:
-  - Double-click the exe and pick a file, or
-  - Drag a file onto the exe (output is written next to the input as <name>_PLU.csv).
+  - Double-click the exe, set the header option and QTY, and pick a file, or
+  - Drag a file onto the exe (it is read as having no header row; output is
+    written next to the input as <name>_PLU.csv).
 """
 
 import csv
@@ -80,13 +85,28 @@ def read_rows(path):
     raise ExtractError(f"Unsupported file type '{ext}'. Please use .xlsx or .csv.")
 
 
-def extract(path, out_path):
+def _cell(row, i):
+    return str(row[i]).strip() if i < len(row) else ""
+
+
+def extract(path, out_path, has_header=False, qty="1"):
+    """qty fills every row in header mode, and blank QTY cells in no-header mode."""
     rows = read_rows(path)
 
     # Drop rows that are entirely empty (e.g. formatted-but-blank Excel rows)
     rows = [r for r in rows if any(str(c).strip() for c in r)]
     if not rows:
         raise ExtractError("The file is empty.")
+
+    if not has_header:
+        # No header row: first column is PLU, second is QTY.
+        count = 0
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for r in rows:
+                w.writerow([_cell(r, 0), _cell(r, 1) or qty])
+                count += 1
+        return count
 
     # The header may not be in the first row (e.g. title/notes rows above it):
     # use the first row that contains a cell matching TARGET_HEADER.
@@ -105,8 +125,7 @@ def extract(path, out_path):
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for r in rows[header_row + 1:]:
-            plu = r[idx].strip() if idx < len(r) else ""
-            w.writerow([plu, 1])
+            w.writerow([_cell(r, idx), qty])
             count += 1
     return count
 
@@ -143,15 +162,26 @@ def run_gui():
     frm = tk.Frame(root, padx=16, pady=16)
     frm.pack()
 
-    tk.Label(
-        frm,
-        text=f"Keeps the '{TARGET_HEADER}' column values, adds a column of 1s,\nand saves the result as a CSV (no header row).",
-        justify="left",
-    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+    has_header = tk.BooleanVar(value=False)
+    qty_var = tk.StringVar(value="1")
+
+    tk.Checkbutton(frm, text="File has a header row", variable=has_header).grid(
+        row=0, column=0, columnspan=2, sticky="w"
+    )
+    tk.Label(frm, text="QTY:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    tk.Entry(frm, textvariable=qty_var, width=10).grid(
+        row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+    )
 
     status = tk.StringVar(value="")
 
     def choose():
+        qty = qty_var.get().strip()
+        try:
+            float(qty)
+        except ValueError:
+            messagebox.showerror(APP_NAME, "QTY must be a number.")
+            return
         path = filedialog.askopenfilename(
             title="Select an Excel or CSV file",
             filetypes=[("Excel or CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")],
@@ -169,7 +199,7 @@ def run_gui():
         if not out:
             return
         try:
-            n = extract(path, out)
+            n = extract(path, out, has_header=has_header.get(), qty=qty)
         except ExtractError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
