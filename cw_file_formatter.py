@@ -1,25 +1,36 @@
 """CW File Formatter
 
-Reads an .xlsx or .csv file, or cells pasted from Excel, and writes a
-two-column CSV (PLU, QTY) with no header row.
+The home page offers two tasks:
+
+Generate PLU file
+  Reads an .xlsx or .csv file, or cells pasted from Excel, and writes a
+  two-column CSV (PLU, QTY) with no header row.
 
   - No header row (default): column 1 is the PLU and column 2 is the QTY.
     A missing or blank QTY becomes the QTY entered in the window (default 1).
   - Header row: keeps only the values of the 'PLU' column and sets every QTY
     to the QTY entered in the window (default 1).
 
+Process B&W Flight
+  Reads a B&W flight workbook (.xlsx or .csv) and lists its sections, e.g.
+  "HEALTHY BREAK 24A BANANA BOAT", so the user can pick which to process.
+  A section starts at a row whose first filled cell is text (the section
+  title); a 'MYCHEM ID' row gives the column headers (a section without its
+  own header row reuses the previous one); rows starting with a number are
+  the section's items.
+
 Usage:
-  - Double-click the exe, pick a file (or paste cells copied from Excel), set
-    the header option and QTY, and click Convert (for a file, output defaults
-    to <name>_PLU.csv next to the input), or
-  - Drag a file onto the exe (it is read as having no header row; output is
-    written next to the input as <name>_PLU.csv).
+  - Double-click the exe and pick a task on the home page, or
+  - Drag a file onto the exe (it is converted to a PLU file, read as having no
+    header row; output is written next to the input as <name>_PLU.csv).
 """
 
 import csv
 import datetime
 import os
+import re
 import sys
+from dataclasses import dataclass, field
 
 TARGET_HEADER = "PLU"
 APP_NAME = "CW File Formatter"
@@ -85,6 +96,8 @@ def read_rows(path):
         return _read_csv(path)
     if ext in (".xlsx", ".xlsm"):
         return _read_xlsx(path)
+    if ext == ".xls":
+        raise ExtractError("Old .xls files aren't supported.\nOpen it in Excel and save it as .xlsx.")
     raise ExtractError(f"Unsupported file type '{ext}'. Please use .xlsx or .csv.")
 
 
@@ -151,6 +164,70 @@ def default_output_path(path):
     return base + "_PLU.csv"
 
 
+# ---------------------------------------------------------------- B&W flight
+BW_ID_HEADER = "MYCHEM ID"
+# Used when items appear before any 'MYCHEM ID' header row in the file.
+BW_DEFAULT_HEADERS = [
+    "MYCHEM ID", "PLU", "DESCRIPTION", "SUPPLIER", "RE-ORDER",
+    "STORE TO PLACE ORDER", "MIN QTY 600MM", "MIN QTY 770MM",
+]
+
+
+@dataclass
+class BWSection:
+    title: str
+    items: list = field(default_factory=list)  # one {header: value} dict per item row
+
+
+def _norm_header(text):
+    """'PLU:' -> 'PLU', ' mychem id ' -> 'MYCHEM ID'."""
+    return re.sub(r"\s+", " ", str(text)).strip().rstrip(":").strip().upper()
+
+
+def _is_number(text):
+    return re.fullmatch(r"\d+(\.0+)?", text) is not None
+
+
+def parse_bw_sections(rows):
+    """Split B&W flight rows into sections. Sections with no items are left out."""
+    sections = []
+    current = None
+    headers = None  # [(column index, header name)] from the latest 'MYCHEM ID' row
+
+    for row in rows:
+        cells = [str(c).strip() for c in row]
+        first = next((i for i, c in enumerate(cells) if c), None)
+        if first is None:
+            continue  # blank (or colour-only) row
+        lead = cells[first]
+
+        if _norm_header(lead) == BW_ID_HEADER:
+            headers = [(i, _norm_header(c)) for i, c in enumerate(cells) if c]
+            continue
+
+        if not _is_number(lead):
+            current = BWSection(re.sub(r"\s+", " ", lead).strip())
+            sections.append(current)
+            continue
+
+        if current is None:
+            continue  # items before any section title: nothing to file them under
+        cols = headers or list(enumerate(BW_DEFAULT_HEADERS, start=first))
+        current.items.append({name: _cell(cells, i) for i, name in cols})
+
+    return [s for s in sections if s.items]
+
+
+def load_bw_sections(path):
+    sections = parse_bw_sections(read_rows(path))
+    if not sections:
+        raise ExtractError(
+            "No sections found in this file.\n\nExpected section title rows (e.g. "
+            "'HEALTHY BREAK 24A BANANA BOAT') followed by rows starting with a MYCHEM ID."
+        )
+    return sections
+
+
 # ---------------------------------------------------------------- GUI
 def enable_high_dpi():
     """Tell Windows we render at native DPI so it doesn't bitmap-stretch (blur) the UI."""
@@ -180,24 +257,44 @@ def set_window_icon(root):
         pass
 
 
-def run_gui():
+def _page_header(frm, title, go_home):
+    """'← Home' button and page title across the top of a task page."""
+    from tkinter import ttk
+
+    bar = ttk.Frame(frm)
+    bar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    ttk.Button(bar, text="← Home", command=go_home).pack(side="left")
+    ttk.Label(bar, text=title, style="PageTitle.TLabel").pack(side="left", padx=12)
+
+
+def build_home_page(parent, open_page):
+    from tkinter import ttk
+
+    frm = ttk.Frame(parent, padding=24)
+    ttk.Label(frm, text=APP_NAME, style="AppTitle.TLabel").pack(anchor="w")
+    ttk.Label(frm, text="What would you like to do?").pack(anchor="w", pady=(2, 16))
+
+    for page, label, blurb in (
+        ("plu", "Generate PLU file",
+         "Turn an Excel/CSV file or pasted cells into a PLU, QTY CSV."),
+        ("bw", "Process B&W Flight",
+         "Open a B&W flight workbook and choose which sections to process."),
+    ):
+        ttk.Button(frm, text=label, style="Big.TButton", command=lambda p=page: open_page(p)).pack(
+            fill="x", pady=(8, 0)
+        )
+        ttk.Label(frm, text=blurb, style="Hint.TLabel").pack(anchor="w", pady=(2, 4))
+    return frm, None
+
+
+def build_plu_page(parent, root, go_home):
     import subprocess
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    root = tk.Tk()
-    root.title(APP_NAME)
-    root.resizable(False, False)
-    set_window_icon(root)
-
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    style.configure("Ok.TLabel", foreground="#1a7f37")
-
-    frm = ttk.Frame(root, padding=16)
-    frm.pack(fill="both", expand=True)
+    frm = ttk.Frame(parent, padding=16)
     frm.columnconfigure(1, weight=1)
+    _page_header(frm, "Generate PLU file", go_home)
 
     mode = tk.StringVar(value="file")  # "file" or "paste"
     in_var = tk.StringVar()
@@ -215,9 +312,9 @@ def run_gui():
         return ""
 
     # --- input source switch
-    ttk.Label(frm, text="Input:").grid(row=0, column=0, sticky="w")
+    ttk.Label(frm, text="Input:").grid(row=1, column=0, sticky="w")
     src_row = ttk.Frame(frm)
-    src_row.grid(row=0, column=1, columnspan=2, sticky="w", padx=6)
+    src_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
 
     # --- file input
     file_box = ttk.Frame(frm)
@@ -304,8 +401,8 @@ def run_gui():
             src_row, text=label, value=value, variable=mode, command=switch_mode
         ).pack(side="left", padx=(0, 12))
 
-    file_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-    paste_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+    file_box.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+    paste_box.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
     paste_box.grid_remove()
 
     # --- output file
@@ -323,7 +420,7 @@ def run_gui():
         return bool(path)
 
     out_row = ttk.Frame(frm)
-    out_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+    out_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
     out_row.columnconfigure(1, weight=1)
     ttk.Label(out_row, text="Output file:").grid(row=0, column=0, sticky="w")
     out_entry = ttk.Entry(out_row, textvariable=out_var, width=48)
@@ -337,20 +434,20 @@ def run_gui():
             lambda *_, e=entry: None if e.focus_get() is e else e.after_idle(e.xview_moveto, 1.0),
         )
 
-    ttk.Separator(frm).grid(row=3, column=0, columnspan=3, sticky="ew", pady=12)
+    ttk.Separator(frm).grid(row=4, column=0, columnspan=3, sticky="ew", pady=12)
 
     # --- options
     ttk.Checkbutton(frm, text="Data has a header row", variable=has_header).grid(
-        row=4, column=0, columnspan=3, sticky="w"
+        row=5, column=0, columnspan=3, sticky="w"
     )
-    ttk.Label(frm, text="QTY:").grid(row=5, column=0, sticky="w", pady=(8, 0))
+    ttk.Label(frm, text="QTY:").grid(row=6, column=0, sticky="w", pady=(8, 0))
     ttk.Spinbox(frm, textvariable=qty_var, from_=1, to=99999, increment=1, width=8).grid(
-        row=5, column=1, sticky="w", padx=6, pady=(8, 0)
+        row=6, column=1, sticky="w", padx=6, pady=(8, 0)
     )
 
     # --- action + result
     bottom = ttk.Frame(frm)
-    bottom.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+    bottom.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(16, 0))
     bottom.columnconfigure(0, weight=1)
 
     status_lbl = ttk.Label(bottom, textvariable=status, style="Ok.TLabel")
@@ -439,14 +536,217 @@ def run_gui():
     ttk.Button(bottom, text="Convert", command=convert, default="active").grid(
         row=0, column=2, padx=(8, 0)
     )
-    root.bind("<Return>", convert)
+    return frm, convert
 
-    # Centre on screen
+
+def build_bw_page(parent, root, go_home):
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    frm = ttk.Frame(parent, padding=16)
+    frm.columnconfigure(0, weight=1)
+    _page_header(frm, "Process B&W Flight", go_home)
+
+    in_var = tk.StringVar()
+    found_var = tk.StringVar(value="Choose a B&W flight file to list its sections.")
+    sel_info = tk.StringVar()
+    state = {"sections": [], "selected": set()}  # selected holds indexes into sections
+
+    UNCHECKED, CHECKED = "☐", "☑"
+
+    # --- input file
+    file_row = ttk.Frame(frm)
+    file_row.grid(row=1, column=0, sticky="ew")
+    file_row.columnconfigure(1, weight=1)
+    ttk.Label(file_row, text="Flight file:").grid(row=0, column=0, sticky="w")
+    in_entry = ttk.Entry(file_row, textvariable=in_var, width=56, state="readonly")
+    in_entry.grid(row=0, column=1, sticky="ew", padx=6)
+
+    # --- sections list
+    ttk.Label(frm, textvariable=found_var).grid(row=2, column=0, sticky="w", pady=(12, 4))
+
+    list_box = ttk.Frame(frm)
+    list_box.grid(row=3, column=0, sticky="nsew")
+    list_box.columnconfigure(0, weight=1)
+    tree = ttk.Treeview(
+        list_box, columns=("check", "section", "items"), show="headings", height=12,
+        selectmode="none",
+    )
+    tree.heading("check", text="")
+    tree.heading("section", text="Section", anchor="w")
+    tree.heading("items", text="Items")
+    tree.column("check", width=36, minwidth=36, stretch=False, anchor="center")
+    tree.column("section", width=420, anchor="w")
+    tree.column("items", width=70, stretch=False, anchor="center")
+    tree.grid(row=0, column=0, sticky="nsew")
+    tree_scroll = ttk.Scrollbar(list_box, orient="vertical", command=tree.yview)
+    tree_scroll.grid(row=0, column=1, sticky="ns")
+    tree.configure(yscrollcommand=tree_scroll.set)
+    tree.tag_configure("on", background="#e6f0fb")
+
+    def refresh_row(idx):
+        on = idx in state["selected"]
+        tree.set(str(idx), "check", CHECKED if on else UNCHECKED)
+        tree.item(str(idx), tags=("on",) if on else ())
+
+    def update_sel_info():
+        secs, sel = state["sections"], state["selected"]
+        if not secs:
+            sel_info.set("")
+            return
+        items = sum(len(secs[i].items) for i in sel)
+        sel_info.set(
+            f"{len(sel)} of {len(secs)} sections selected"
+            + (f" ({items} item{'s' if items != 1 else ''})" if sel else "")
+        )
+
+    def toggle(idx):
+        state["selected"].symmetric_difference_update({idx})
+        refresh_row(idx)
+        update_sel_info()
+
+    def on_click(event):
+        row = tree.identify_row(event.y)
+        if row and tree.identify_region(event.x, event.y) == "cell":
+            tree.focus(row)
+            toggle(int(row))
+        return "break"
+
+    def on_space(_):
+        row = tree.focus()
+        if row:
+            toggle(int(row))
+        return "break"
+
+    tree.bind("<Button-1>", on_click)
+    tree.bind("<space>", on_space)
+
+    def set_all(on):
+        state["selected"] = set(range(len(state["sections"]))) if on else set()
+        for i in range(len(state["sections"])):
+            refresh_row(i)
+        update_sel_info()
+
+    sel_row = ttk.Frame(frm)
+    sel_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+    sel_row.columnconfigure(2, weight=1)
+    ttk.Button(sel_row, text="Select all", command=lambda: set_all(True)).grid(row=0, column=0)
+    ttk.Button(sel_row, text="Select none", command=lambda: set_all(False)).grid(
+        row=0, column=1, padx=(6, 0)
+    )
+    ttk.Label(sel_row, textvariable=sel_info).grid(row=0, column=2, sticky="e")
+
+    # --- loading
+    def load(path):
+        try:
+            sections = load_bw_sections(path)
+        except ExtractError as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        except PermissionError:
+            messagebox.showerror(APP_NAME, "Could not open the file.\nIs it open in Excel?")
+            return
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Could not read the file:\n{e}")
+            return
+        in_var.set(os.path.normpath(path))
+        in_entry.after_idle(in_entry.xview_moveto, 1.0)
+        state["sections"], state["selected"] = sections, set()
+        tree.delete(*tree.get_children())
+        for i, s in enumerate(sections):
+            tree.insert("", "end", iid=str(i), values=(UNCHECKED, s.title, len(s.items)))
+        found_var.set(
+            f"{len(sections)} section{'s' if len(sections) != 1 else ''} found. "
+            "Click the sections you want to process:"
+        )
+        update_sel_info()
+        tree.focus_set()
+
+    def browse_input():
+        path = filedialog.askopenfilename(
+            title="Select the B&W flight file",
+            filetypes=[("Excel or CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")],
+        )
+        if path:
+            load(path)
+
+    ttk.Button(file_row, text="Browse…", command=browse_input).grid(row=0, column=2)
+
+    # --- action
+    bottom = ttk.Frame(frm)
+    bottom.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+    bottom.columnconfigure(0, weight=1)
+
+    def process(event=None):
+        if not state["sections"]:
+            messagebox.showerror(APP_NAME, "Choose a B&W flight file first.")
+            return
+        chosen = [state["sections"][i] for i in sorted(state["selected"])]
+        if not chosen:
+            messagebox.showerror(APP_NAME, "Select at least one section to process.")
+            return
+        process_bw_sections(chosen)
+
+    def process_bw_sections(chosen):
+        # Placeholder until the processing step is defined.
+        messagebox.showinfo(
+            APP_NAME,
+            "Sections selected for processing:\n\n"
+            + "\n".join(f"•  {s.title} ({len(s.items)} items)" for s in chosen),
+        )
+
+    ttk.Button(bottom, text="Process selected", command=process, default="active").grid(
+        row=0, column=1
+    )
+    return frm, process
+
+
+def run_gui():
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title(APP_NAME)
+    root.resizable(False, False)
+    set_window_icon(root)
+
+    style = ttk.Style(root)
+    if "vista" in style.theme_names():
+        style.theme_use("vista")
+    style.configure("Ok.TLabel", foreground="#1a7f37")
+    style.configure("Hint.TLabel", foreground="#5f6368")
+    style.configure("AppTitle.TLabel", font=("Segoe UI", 16, "bold"))
+    style.configure("PageTitle.TLabel", font=("Segoe UI", 12, "bold"))
+    style.configure("Big.TButton", font=("Segoe UI", 11), padding=(16, 10))
+
+    container = ttk.Frame(root)
+    container.pack(fill="both", expand=True)
+
+    pages = {}  # name -> (frame, Enter-key action or None)
+    current = {"name": None}
+
+    def show(name):
+        if current["name"]:
+            pages[current["name"]][0].pack_forget()
+        frame, action = pages[name]
+        frame.pack(fill="both", expand=True)
+        current["name"] = name
+        root.bind("<Return>", action if action else lambda e: None)
+
+    go_home = lambda: show("home")  # noqa: E731
+    pages["home"] = build_home_page(container, show)
+    pages["plu"] = build_plu_page(container, root, go_home)
+    pages["bw"] = build_bw_page(container, root, go_home)
+    root.bind("<Escape>", lambda e: go_home())
+    show("home")
+
+    # Centre on screen (sized for the largest page so switching pages doesn't push it off-screen)
     root.update_idletasks()
-    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+    w = max(f.winfo_reqwidth() for f, _ in pages.values())
+    h = max(f.winfo_reqheight() for f, _ in pages.values())
     x = (root.winfo_screenwidth() - w) // 2
     y = (root.winfo_screenheight() - h) // 3
-    root.geometry(f"+{x}+{y}")
+    root.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     root.mainloop()
 
