@@ -6,11 +6,12 @@ Generate PLU file
   Reads an .xlsx or .csv file, or cells pasted from Excel, and writes a
   two-column CSV (PLU, QTY) with no header row. The PLU column can be chosen in
   the window; every other column is ignored and every QTY is the QTY entered in
-  the window (default 1). Rows without a PLU are left out.
+  the window (default 1). Rows without a PLU are left out. Values can be changed and
+  rows deleted in the preview; the input file itself is never changed.
 
-  - No header row (default): the first column is assumed to be the PLU.
-  - Header row: the column headed 'PLU' is assumed, and rows up to the header
-    row are left out.
+  - No header row: the first column is assumed to be the PLU.
+  - Header row (assumed if a cell says 'PLU'): the column headed 'PLU' is assumed,
+    and rows up to the header row are left out.
 
 Process B&W Flight
   Reads a B&W flight workbook (.xlsx or .csv) and lists its sections, e.g.
@@ -31,9 +32,8 @@ Process B&W Flight
 Usage:
   - Double-click the exe and pick a task on the home page (files can be dropped
     onto the window if tkinterdnd2 is installed), or
-  - Drag a file onto the exe (its first column becomes a PLU file with a QTY of 1,
-    read as having no header row; output is written next to the input as
-    <name>_PLU.csv).
+  - Drag a file onto the exe (its assumed PLU column becomes a PLU file with a QTY
+    of 1; output is written next to the input as <name>_PLU.csv).
 """
 
 import csv
@@ -124,30 +124,35 @@ def parse_pasted(text):
     return [list(row) for row in csv.reader(io.StringIO(text), delimiter="\t")]
 
 
-def plu_table(rows, has_header=False):
-    """Split rows into ([(column index, label)], body rows, index of the assumed PLU column).
+def has_plu_header(rows):
+    """Whether any cell is a 'PLU' heading."""
+    return any(str(c).strip().lower() == TARGET_HEADER.lower() for r in rows for c in r)
 
-    Columns with nothing in them are left out. With a header row (the first row
+
+def plu_table(rows, has_header=False):
+    """Split rows into ([(column index, label)], body, index of the assumed PLU column).
+
+    body is [(index into rows, row)]. Rows and columns with nothing in them are left out. With a header row (the first row
     holding a 'PLU' cell, else the first row) the assumed PLU column is the one headed
     'PLU', or None if there isn't one. Without, it is the first column.
     """
     # Drop rows that are entirely empty (e.g. formatted-but-blank Excel rows)
-    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    body = [(i, r) for i, r in enumerate(rows) if any(str(c).strip() for c in r)]
     header, default = [], None
-    if has_header and rows:
+    if has_header and body:
         # The header may not be in the first row (e.g. title/notes rows above it)
         start = 0
-        for ri, row in enumerate(rows):
+        for n, (_, row) in enumerate(body):
             names = [str(c).strip().lower() for c in row]
             if TARGET_HEADER.lower() in names:
-                start, default = ri, names.index(TARGET_HEADER.lower())
+                start, default = n, names.index(TARGET_HEADER.lower())
                 break
-        header, rows = rows[start], rows[start + 1:]
+        header, body = body[start][1], body[start + 1:]
 
     columns, used = [], set()
-    for i in range(max((len(r) for r in [header, *rows]), default=0)):
+    for i in range(max((len(r) for r in [header, *(r for _, r in body)]), default=0)):
         label = re.sub(r"\s+", " ", _cell(header, i))
-        if not label and not any(_cell(r, i) for r in rows):
+        if not label and not any(_cell(r, i) for _, r in body):
             continue
         if not label:
             label = f"Column {i + 1}"
@@ -157,12 +162,13 @@ def plu_table(rows, has_header=False):
         columns.append((i, label))
     if not has_header and columns:
         default = columns[0][0]
-    return columns, rows, default
+    return columns, body, default
 
 
-def extract(path, out_path, has_header=False, qty="1", plu_col=None):
-    """Convert an .xlsx/.csv file. See extract_rows."""
-    return extract_rows(read_rows(path), out_path, has_header, qty, plu_col, source="file")
+def extract(path, out_path, qty="1"):
+    """Convert an .xlsx/.csv file using the assumed PLU column. See extract_rows."""
+    rows = read_rows(path)
+    return extract_rows(rows, out_path, has_plu_header(rows), qty, source="file")
 
 
 def extract_rows(rows, out_path, has_header=False, qty="1", plu_col=None, source="input"):
@@ -178,7 +184,7 @@ def extract_rows(rows, out_path, has_header=False, qty="1", plu_col=None, source
         plu_col = default
     if plu_col is None:
         raise ExtractError(f"No '{TARGET_HEADER}' column header found anywhere in the {source}.")
-    plus = [plu for plu in (_cell(r, plu_col) for r in body) if plu]
+    plus = [plu for plu in (_cell(r, plu_col) for _, r in body) if plu]
     if not plus:
         raise ExtractError(f"The PLU column has nothing in it in the {source}.")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -303,6 +309,7 @@ class StockTable:
     columns: dict  # {label: column index}, the columns that could be the planogram
     rows: dict  # {PLU key: row}
     conflicts: set = field(default_factory=set)  # PLU keys on several rows that differ
+    body: list = field(default_factory=list)  # [(index into the rows parsed, row)], every item row
 
 
 def parse_stock_rows(rows, source="file"):
@@ -332,10 +339,11 @@ def parse_stock_rows(rows, source="file"):
         columns[label] = ci
 
     table = StockTable(plu_col, soh_col, columns, {})
-    for row in rows[ri + 1:]:
+    for i, row in enumerate(rows[ri + 1:], start=ri + 1):
         key = _plu_key(_cell(row, plu_col))
         if not key or key == TARGET_HEADER:
             continue  # footer, or the header row repeated
+        table.body.append((i, row))
         first = table.rows.setdefault(key, row)
         if first != row:
             table.conflicts.add(key)
@@ -477,7 +485,9 @@ def enable_high_dpi():
     import ctypes
 
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware (Win 8.1+)
+        # System aware (Win 8.1+). Tk can't rescale a window moved to a monitor with another
+        # scaling, so leave that to Windows rather than claim to be per-monitor aware.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:  # noqa: BLE001
         try:
             ctypes.windll.user32.SetProcessDPIAware()  # system aware (Vista+)
@@ -500,7 +510,212 @@ def set_window_icon(root):
 
 BW_STEPS = ("Sections", "Stock report", "Review")
 FILE_TYPES = [("Excel or CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")]
-UNCHECKED, CHECKED = "☐", "☑"
+# States of the tick boxes in the lists. BLOCKED: there is nothing to tick.
+UNCHECKED, CHECKED, PARTLY, BLOCKED = "☐", "☑", "▣", ""
+CHECK_WIDTH = 44  # of the column they are in
+
+# Display scaling: 1.0 at 100%, 1.5 at 150%. Set when the window is made.
+_scale = 1.0
+
+LIGHT = {
+    "field": "#ffffff", "text": "#1c1c1c", "hint": "#5f6368", "ok": "#1a7f37", "warn": "#b3261e",
+    "step": "#005fb8", "on": "#e6f0fb", "off": "#80868b", "section": "#e9ebee", "border": "#d9d9d9", "box": "#868686", "mark": "#ffffff",
+    "selected": "#b9d7f5",
+}
+DARK = {
+    "field": "#202020", "text": "#fafafa", "hint": "#a8adb3", "ok": "#6ccb5f", "warn": "#ff99a4",
+    "step": "#57c8ff", "on": "#1d3146", "off": "#8b9096", "section": "#343434", "border": "#3a3a3a", "box": "#9a9a9a", "mark": "#000000",
+    "selected": "#2b5a88",
+}
+
+
+def _px(n):
+    """A size in pixels at 100% display scaling, in pixels at the current scaling."""
+    return round(n * _scale)
+
+
+def _check_png(state, size, colors, pad=0):
+    """PNG of a tick box, drawn here so that it is sharp at any size and fits the colours.
+
+    pad is the width of the empty space on its left and right.
+    """
+    import struct
+    import zlib
+
+    def rgb(name):
+        return tuple(int(colors[name][i:i + 2], 16) for i in (1, 3, 5))
+
+    filled = state in (CHECKED, PARTLY)
+    edge = rgb("step") if filled else rgb("border" if state == BLOCKED else "box")
+    inside, mark = rgb("step") if filled else rgb("field"), rgb("mark")
+    line = 1.25 * _scale / size  # width of the border
+
+    def in_box(x, y, inset):
+        """Whether a point is in the rounded square, shrunk by inset."""
+        half, radius = 0.5 - inset, 0.2 - inset
+        dx, dy = abs(x - 0.5) - (half - radius), abs(y - 0.5) - (half - radius)
+        if dx > 0 and dy > 0:
+            return math.hypot(dx, dy) <= radius
+        return max(dx, dy) <= radius
+
+    def near(x, y, x1, y1, x2, y2):
+        """Whether a point is on a line drawn with a round pen."""
+        t = ((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / ((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        t = min(max(t, 0), 1)
+        return math.hypot(x - x1 - t * (x2 - x1), y - y1 - t * (y2 - y1)) <= 0.06
+
+    def color(x, y):
+        if not in_box(x, y, 0.02):
+            return None
+        if state == CHECKED and (
+            near(x, y, 0.27, 0.52, 0.43, 0.68) or near(x, y, 0.43, 0.68, 0.74, 0.35)
+        ):
+            return mark
+        if state == PARTLY and near(x, y, 0.28, 0.5, 0.72, 0.5):
+            return mark
+        return inside if in_box(x, y, 0.02 + line) else edge
+
+    steps = [(i + 0.5) / 4 for i in range(4)]  # 4 x 4 samples in each pixel, for smooth edges
+    data = bytearray()
+    for py in range(size):
+        data.append(0)  # PNG filter type: none
+        data += bytes(4 * pad)
+        for px in range(size):
+            hits = [color((px + a) / size, (py + b) / size) for a in steps for b in steps]
+            hits = [c for c in hits if c]
+            n = len(hits) or 1
+            data += bytes(sum(c[i] for c in hits) // n for i in range(3))
+            data.append(255 * len(hits) // 16)
+        data += bytes(4 * pad)
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+    header = struct.pack(">IIBBBBB", size + 2 * pad, size, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(
+        b"IDAT", zlib.compress(bytes(data))
+    ) + chunk(b"IEND", b"")
+
+
+def _check_column(tree, root, on_heading):
+    """Set up a list's first column (#0) for tick boxes; clicking its heading calls on_heading."""
+    tree.configure(show="tree headings", style="Check.Treeview")
+    tree.column("#0", width=_px(CHECK_WIDTH), minwidth=_px(CHECK_WIDTH), stretch=False)
+    tree.heading("#0", image=root.heading_checks[BLOCKED], anchor="center", command=on_heading)
+
+    def motion(event):
+        over = tree.identify_column(event.x) == "#0" and (
+            tree.identify_region(event.x, event.y) == "heading" or tree.identify_row(event.y)
+        )
+        tree.configure(cursor="hand2" if over else "")
+
+    tree.bind("<Motion>", motion, add="+")
+
+
+def apply_theme(root, dark=False):
+    """Colours and fonts. root.themed says whether the modern theme is available.
+
+    Functions in root.on_theme are called with the colours, for what styles don't reach.
+    """
+    from tkinter import font, ttk
+
+    style = ttk.Style(root)
+    try:
+        import sv_ttk
+
+        sv_ttk.set_theme("dark" if dark else "light", root)
+        root.themed = True
+    except Exception:  # noqa: BLE001 - the look is a nicety; fall back to the Windows theme
+        root.themed = dark = False
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+    colors = DARK if dark else LIGHT
+
+    # sv_ttk's fonts are sized in pixels, so they ignore display scaling, and come with
+    # Windows 11 only. Sizes in points follow the scaling.
+    sizes = {
+        "TkDefaultFont": 10, "TkTextFont": 10, "TkHeadingFont": 9,
+        "SunValleyCaptionFont": 9, "SunValleyBodyFont": 10, "SunValleyBodyStrongFont": 10,
+    }
+    existing = set(font.names(root))
+    for name, size in sizes.items():
+        if name in existing:
+            font.nametofont(name, root).configure(family="Segoe UI", size=size)
+    root.option_add("*TCombobox*Listbox.font", "TkTextFont")
+
+    for name in ("Ok", "Warn", "Hint"):
+        style.configure(f"{name}.TLabel", foreground=colors[name.lower()])
+    style.configure("Step.TLabel", font=("Segoe UI", 10, "bold"), foreground=colors["step"])
+    style.configure("AppTitle.TLabel", font=("Segoe UI", 18, "bold"))
+    style.configure("PageTitle.TLabel", font=("Segoe UI", 13, "bold"))
+    style.configure("DialogOk.TLabel", font=("Segoe UI", 13, "bold"), foreground=colors["ok"])
+    style.configure("DialogWarn.TLabel", font=("Segoe UI", 13, "bold"), foreground=colors["warn"])
+    style.configure("Big.TButton", font=("Segoe UI", 12), padding=(_px(16), _px(10)))
+    row_height = font.nametofont("TkDefaultFont", root).metrics("linespace") + _px(8)
+    style.configure("Treeview", rowheight=row_height)
+    if root.themed:
+        if "White.field" not in style.element_names():
+            # Plain box: the theme's own is drawn in the window's colour
+            style.element_create("White.field", "from", "clam", "Treeview.field")
+        style.layout("Treeview", [("White.field", {"sticky": "nswe", "border": 1, "children": [
+            ("Treeview.padding", {"sticky": "nswe", "children": [
+                ("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        style.configure(
+            "Treeview", background=colors["field"], fieldbackground=colors["field"],
+            bordercolor=colors["border"], lightcolor=colors["field"],
+        )
+        style.configure("Heading", padding=(_px(4), _px(3)))  # in line with the cells' text
+        style.map(
+            "Treeview", background=[("selected", colors["selected"])],
+            foreground=[("selected", colors["text"])],
+        )
+    # Tick boxes: the same images are redrawn, so the lists using them follow
+    if not hasattr(root, "checks"):
+        import tkinter
+
+        states = (UNCHECKED, CHECKED, PARTLY, BLOCKED)
+        root.checks = {state: tkinter.PhotoImage(master=root) for state in states}
+        root.heading_checks = {state: tkinter.PhotoImage(master=root) for state in states}
+    size = _px(17)
+    # Headings put an image on the right, so fill the heading to line up with the rows
+    pad = (_px(CHECK_WIDTH) - 2 * _px(4) - size) // 2
+    for state in root.checks:
+        root.checks[state].configure(data=_check_png(state, size, colors))
+        root.heading_checks[state].configure(data=_check_png(state, size, colors, pad))
+    style.layout("Check.Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+        ("Treeitem.image", {"sticky": ""})]})])
+
+    # The tree's own cells are too low for the theme's entry box
+    style.layout("Cell.TEntry", [("Entry.padding", {"sticky": "nswe", "children": [
+        ("Entry.textarea", {"sticky": "nswe"})]})])
+    style.configure("Cell.TEntry", padding=(_px(3), 0))
+
+    for update in root.on_theme:
+        update(colors)
+    _dark_title_bar(root, dark)
+    return colors
+
+
+def _dark_title_bar(window, dark):
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        window.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = wintypes.HWND(user32.GetParent(wintypes.HWND(window.winfo_id())))
+        value = ctypes.c_int(int(dark))
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), 4)
+        # Windows 10 only repaints the title bar when it changes between active and
+        # inactive, so draw it as the other one and back (0x86 = WM_NCACTIVATE)
+        active = int(user32.GetForegroundWindow() == hwnd.value)
+        for state in (1 - active, active):
+            user32.SendMessageW(hwnd, 0x86, wintypes.WPARAM(state), wintypes.LPARAM(0))
+    except Exception:  # noqa: BLE001 - cosmetic only
+        pass
 
 
 @dataclass
@@ -520,11 +735,19 @@ def _one_line(text):
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
+def _natural_key(text):
+    """Sort key where numbers sort by value, so 'BREAK 9' comes before 'BREAK 24A'."""
+    return [
+        (0, int(part), "") if part.isdecimal() else (1, 0, part)
+        for part in re.split(r"(\d+)", str(text).upper()) if part
+    ]
+
+
 def _page(parent, title, go_home, step=None):
     """A task page: header, body that takes the spare space. Returns (frame, body)."""
     from tkinter import ttk
 
-    frm = ttk.Frame(parent, padding=16)
+    frm = ttk.Frame(parent, padding=_px(16))
     frm.columnconfigure(0, weight=1)
     frm.rowconfigure(1, weight=1)
     bar = ttk.Frame(frm)
@@ -559,7 +782,9 @@ def _footer(frm, text, command, go_back=None):
         ttk.Button(bar, text="← Back", command=go_back).grid(row=0, column=0)
     reason_lbl = ttk.Label(bar, style="Hint.TLabel")
     reason_lbl.grid(row=0, column=1, sticky="e", padx=10)
-    button = ttk.Button(bar, text=text, command=command, default="active", width=14)
+    button = ttk.Button(
+        bar, text=text, command=command, default="active", width=14, style="Accent.TButton"
+    )
     button.grid(row=0, column=2)
 
     def set_reason(reason):
@@ -571,6 +796,25 @@ def _footer(frm, text, command, go_back=None):
             command()
 
     return run, set_reason
+
+
+def _scrollbar(widget, orient, row, column, on_scroll=None):
+    """Scrollbar beside a widget in its parent's grid, hidden while there is nothing to scroll."""
+    from tkinter import ttk
+
+    vertical = orient == "vertical"
+    bar = ttk.Scrollbar(
+        widget.master, orient=orient, command=widget.yview if vertical else widget.xview
+    )
+    bar.grid(row=row, column=column, sticky="ns" if vertical else "ew")
+
+    def scrolled(first, last):
+        (bar.grid_remove if float(first) <= 0 and float(last) >= 1 else bar.grid)()
+        bar.set(first, last)
+        if on_scroll:
+            on_scroll()
+
+    widget.configure(**{"yscrollcommand" if vertical else "xscrollcommand": scrolled})
 
 
 def _show_end(entry):
@@ -600,10 +844,10 @@ def _result_dialog(root, title, message, buttons=(), warn=False):
     win.title(APP_NAME)
     win.transient(root)
     win.resizable(False, False)
-    frm = ttk.Frame(win, padding=20)
+    frm = ttk.Frame(win, padding=_px(20))
     frm.pack(fill="both", expand=True)
     ttk.Label(frm, text=title, style="DialogWarn.TLabel" if warn else "DialogOk.TLabel").pack(anchor="w")
-    ttk.Label(frm, text=message, wraplength=520, justify="left").pack(anchor="w", pady=(10, 16))
+    ttk.Label(frm, text=message, wraplength=_px(520), justify="left").pack(anchor="w", pady=(10, 16))
     bar = ttk.Frame(frm)
     bar.pack(anchor="e")
 
@@ -615,7 +859,7 @@ def _result_dialog(root, title, message, buttons=(), warn=False):
 
     for label, command in buttons:
         ttk.Button(bar, text=label, command=lambda c=command: press(c)).pack(side="left", padx=(0, 8))
-    close = ttk.Button(bar, text="Close", command=press, default="active")
+    close = ttk.Button(bar, text="Close", command=press, default="active", style="Accent.TButton")
     close.pack(side="left")
 
     def on_return(event):
@@ -629,60 +873,175 @@ def _result_dialog(root, title, message, buttons=(), warn=False):
     y = root.winfo_rooty() + (root.winfo_height() - win.winfo_reqheight()) // 3
     win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
     win.deiconify()
+    _dark_title_bar(win, root.dark)
     win.grab_set()
     close.focus_set()
     return win
 
 
-class RowsTable:
-    """Read-only table of rows of text. Place .frame.
+class CellEditor:
+    """Entry placed over a Treeview cell to change its value.
 
-    on_pick(column number) is called when a column is clicked.
+    on_done(iid, column, text) is called when it closes, with None as the text if the
+    user cancelled.
     """
 
-    MAX_ROWS = 1000
+    def __init__(self, tree, on_done, justify="left"):
+        self.tree, self.on_done, self.justify = tree, on_done, justify
+        self.entry = self.cell = None
+        for event in ("<Configure>", "<Unmap>"):
+            tree.bind(event, lambda e: self.close(), add="+")
 
-    def __init__(self, parent, height=6, on_pick=None):
+    def open(self, iid, column, text):
+        from tkinter import ttk
+
+        tree = self.tree
+        self.close()
+        if not tree.exists(iid):
+            return
+        tree.see(iid)
+        tree.update_idletasks()
+        bbox = tree.bbox(iid, column)
+        if not bbox:
+            return  # scrolled out of sight sideways
+        x, y, w, h = bbox
+        left = max(x, 0)
+        entry = ttk.Entry(tree, justify=self.justify, style="Cell.TEntry")
+        entry.insert(0, text)
+        entry.select_range(0, "end")
+        entry.place(x=left, y=y, width=min(x + w, tree.winfo_width()) - left, height=h)
+        self.entry, self.cell = entry, (iid, column)
+
+        def done(apply):
+            self.close(apply)
+            tree.focus_set()
+            return "break"
+
+        def left_entry():
+            # Only if the focus really moved to something else in this window
+            if self.entry is entry and entry.focus_get() not in (None, entry):
+                self.close()
+
+        entry.bind("<Return>", lambda e: done(True))
+        entry.bind("<Tab>", lambda e: done(True))
+        entry.bind("<Escape>", lambda e: done(False))
+        entry.bind("<FocusOut>", lambda e: tree.after(50, left_entry))
+        entry.focus_set()
+
+    def close(self, apply=True):
+        """Close the entry if it is open. Returns what on_done returned, else True."""
+        if self.entry is None:
+            return True
+        entry, cell = self.entry, self.cell
+        self.entry = None  # first: destroying the entry fires FocusOut
+        text = entry.get().strip()
+        entry.destroy()
+        return self.on_done(*cell, text if apply else None)
+
+
+class RowsTable:
+    """Table of rows of text, whose values can be changed and rows deleted.
+
+    .rows holds all the rows read; show() displays some of their rows and columns.
+    on_change() is called after the user changes .rows, and should call show().
+    on_pick(column number) is called when a column heading is clicked.
+    Place .frame, and the frame made by buttons().
+    """
+
+    MAX_ROWS = 5000
+
+    def __init__(self, parent, height, on_change, on_pick=None):
         from tkinter import font, ttk
 
         self.frame = ttk.Frame(parent)
         self.frame.columnconfigure(0, weight=1)
         self.frame.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(self.frame, show="headings", height=height, selectmode="browse")
+        self.tree = ttk.Treeview(self.frame, show="headings", height=height, selectmode="extended")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        ys = ttk.Scrollbar(self.frame, orient="vertical", command=self.tree.yview)
-        ys.grid(row=0, column=1, sticky="ns")
-        xs = ttk.Scrollbar(self.frame, orient="horizontal", command=self.tree.xview)
-        xs.grid(row=1, column=0, sticky="ew")
-        self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        # An open entry doesn't scroll with the table, so close it
+        _scrollbar(self.tree, "vertical", 0, 1, lambda: self.finish())
+        _scrollbar(self.tree, "horizontal", 1, 0, lambda: self.finish())
         self.font = font.nametofont("TkDefaultFont")
-        self.headings = []
-        self.on_pick = on_pick
-        if on_pick:
-            self.tree.bind("<Button-1>", self._clicked, add="+")
+        self.rows, self.headings, self.col_ids, self.all_ids = [], [], [], []
+        self.shown = {}  # {row index: values displayed}
+        self.undo_steps = []  # ("edit", row, column, old text) or ("delete", [(row, cells)])
+        self.on_change, self.on_pick = on_change, on_pick
+        self.delete_btn = self.undo_btn = None
+        self.editor = CellEditor(self.tree, self._edited)
+        self.tree.bind("<Button-1>", self._clicked, add="+")
+        self.tree.bind("<Double-1>", self._double_clicked)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.tree.bind("<Control-z>", lambda e: self.undo())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_buttons())
 
-    def _clicked(self, event):
-        if self.tree.identify_region(event.x, event.y) in ("cell", "heading"):
-            column = int(self.tree.identify_column(event.x)[1:]) - 1
-            if 0 <= column < len(self.headings):
-                self.on_pick(column)
+    def buttons(self, parent):
+        from tkinter import ttk
 
-    def set(self, headings, rows, marked=None):
+        frm = ttk.Frame(parent)
+        self.delete_btn = ttk.Button(frm, text="Delete rows", command=self.delete_selected)
+        self.delete_btn.pack(side="left")
+        self.undo_btn = ttk.Button(frm, text="Undo", command=self.undo)
+        self.undo_btn.pack(side="left", padx=(6, 0))
+        self._update_buttons()
+        return frm
+
+    def _update_buttons(self):
+        if self.delete_btn:
+            self.delete_btn.state(["!disabled" if self._selected() else "disabled"])
+            self.undo_btn.state(["!disabled" if self.undo_steps else "disabled"])
+
+    def _selected(self):
+        return [int(i) for i in self.tree.selection() if i.isdigit()]
+
+    # --- display
+    def load(self, rows):
+        """Take new rows, forgetting earlier changes. Call show() afterwards."""
+        self.editor.close(False)
+        self.rows, self.undo_steps = [list(r) for r in rows], []
+
+    def show(self, headings, row_ids, col_ids, marked=None, keep_place=False):
+        """Show the given rows and columns (indexes into .rows) under the headings."""
+        self.editor.close(False)
         tree = self.tree
+        place = tree.yview()[0], tree.xview()[0], tree.selection()
+        before, self.headings = (self.headings, self.col_ids, len(self.all_ids)), [
+            _one_line(h) for h in headings
+        ]
+        headings, self.col_ids, self.all_ids = self.headings, list(col_ids), list(row_ids)
+        old, shown = self.shown, {
+            r: [_one_line(_cell(self.rows[r], c)) for c in self.col_ids]
+            for r in row_ids[: self.MAX_ROWS]
+        }
+        self.shown = shown
+        if keep_place and before == (headings, self.col_ids, len(row_ids)) and list(old) == list(shown):
+            for r, values in shown.items():
+                if values != old[r]:
+                    tree.item(str(r), values=values)
+            self.mark(marked)
+            self._update_buttons()
+            return
         tree.delete(*tree.get_children())
-        self.headings = headings = [_one_line(h) for h in headings]
-        shown = [[_one_line(_cell(r, i)) for i in range(len(headings))] for r in rows[: self.MAX_ROWS]]
         tree.configure(columns=[f"c{i}" for i in range(len(headings))])
+        first = list(shown.values())[:100]
         for i, text in enumerate(headings):
-            widest = max([r[i] for r in shown[:100]], key=len, default="")
+            widest = max([r[i] for r in first], key=len, default="")
             heading = f"✔ PLU: {text}" if self.on_pick else text
-            width = max(self.font.measure(heading), self.font.measure(widest)) + 24
-            tree.column(f"c{i}", width=min(max(width, 50), 300), stretch=False, anchor="w")
+            width = max(self.font.measure(heading), self.font.measure(widest)) + _px(24)
+            tree.column(
+                f"c{i}", width=min(max(width, _px(50)), _px(300)), minwidth=_px(30),
+                stretch=False, anchor="w",
+            )
         self.mark(marked)
-        for r in shown:
-            tree.insert("", "end", values=r)
-        if headings and len(rows) > len(shown):
-            tree.insert("", "end", values=[f"… and {len(rows) - len(shown):,} more rows"])
+        for r, values in shown.items():
+            tree.insert("", "end", iid=str(r), values=values)
+        if headings and len(row_ids) > len(shown):
+            tree.insert("", "end", values=[f"… and {len(row_ids) - len(shown):,} more rows"])
+        if keep_place:
+            tree.update_idletasks()
+            tree.yview_moveto(place[0])
+            tree.xview_moveto(place[1])
+            tree.selection_set([i for i in place[2] if tree.exists(i)])
+        self._update_buttons()
 
     def mark(self, column):
         """Show which column is the PLU column."""
@@ -691,19 +1050,89 @@ class RowsTable:
                 text = "✔ PLU" if text.upper() == TARGET_HEADER else f"✔ PLU: {text}"
             self.tree.heading(f"c{i}", text=text, anchor="w")
 
+    # --- clicks
+    def _clicked(self, event):
+        self.finish()
+        if self.on_pick and self.tree.identify_region(event.x, event.y) == "heading":
+            column = int(self.tree.identify_column(event.x)[1:]) - 1
+            if 0 <= column < len(self.headings):
+                self.on_pick(column)
+
+    def _double_clicked(self, event):
+        tree = self.tree
+        row = tree.identify_row(event.y)
+        if tree.identify_region(event.x, event.y) != "cell" or not row.isdigit():
+            return None
+        column = int(tree.identify_column(event.x)[1:]) - 1
+        text = _one_line(_cell(self.rows[int(row)], self.col_ids[column]))
+        self.editor.open(row, f"c{column}", text)
+        return "break"
+
+    # --- changes
+    def finish(self):
+        """Apply the value being changed, if any."""
+        self.editor.close()
+
+    def _edited(self, iid, column, text):
+        row, col = int(iid), self.col_ids[int(column[1:])]
+        old = str(_cell(self.rows[row], col))
+        if text is None or text == _one_line(old):
+            return True
+        self._put(row, col, text)
+        self._changed(("edit", row, col, old))
+        return True
+
+    def _put(self, row, col, text):
+        cells = self.rows[row]
+        cells.extend([""] * (col + 1 - len(cells)))
+        cells[col] = text
+
+    def delete_selected(self):
+        self.finish()
+        ids = sorted(self._selected())
+        if not ids:
+            return
+        removed = [(i, self.rows[i]) for i in ids]
+        for i in reversed(ids):
+            del self.rows[i]
+        self.tree.selection_set(())
+        self._changed(("delete", removed))
+
+    def undo(self):
+        self.editor.close(False)
+        if not self.undo_steps:
+            return
+        kind, *step = self.undo_steps.pop()
+        if kind == "edit":
+            self._put(*step)
+        else:
+            for i, cells in step[0]:
+                self.rows.insert(i, cells)
+        self.tree.selection_set(())
+        self._changed()
+
+    def _changed(self, step=None):
+        if step:
+            self.undo_steps.append(step)
+        self.on_change()
+        self._update_buttons()
+
 
 def _raw_table(rows):
-    """Headings and rows to show for cells without a recognised header row."""
-    rows = [r for r in rows if any(str(c).strip() for c in r)]
-    return [f"Column {i + 1}" for i in range(max((len(r) for r in rows), default=0))], rows
+    """What to show for rows without a recognised header row, as RowsTable.show arguments."""
+    ids = [i for i, r in enumerate(rows) if any(str(c).strip() for c in r)]
+    cols = range(max((len(rows[i]) for i in ids), default=0))
+    return [f"Column {c + 1}" for c in cols], ids, cols
 
 
-def _paste_box(parent, root, on_change, to_table, height=6, on_pick=None):
+def _paste_box(parent, root, on_change, view, height=6, on_pick=None):
     """Box for cells pasted from Excel: a text box that turns into a table after pasting.
 
-    to_table(rows) gives the arguments for RowsTable.set. Returns
-    (frame, get_text, refresh table, focus, table).
+    on_change(edited) is called when the rows (table.rows) change; edited is True if a
+    value was changed or rows deleted in the table. view() gives the RowsTable.show
+    arguments. Returns (frame, table, focus).
     """
+    import io
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -722,14 +1151,16 @@ def _paste_box(parent, root, on_change, to_table, height=6, on_pick=None):
         text_frame, height=height, width=60, wrap="none", undo=True, relief="solid", borderwidth=1
     )
     txt.grid(row=0, column=0, sticky="nsew")
-    scroll = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
-    scroll.grid(row=0, column=1, sticky="ns")
-    txt.configure(yscrollcommand=scroll.set)
-    table = RowsTable(box, height, on_pick)
+    _scrollbar(txt, "vertical", 0, 1)
+    root.on_theme.append(lambda colors: txt.configure(
+        background=colors["field"], foreground=colors["text"], insertbackground=colors["text"]
+    ))
+    table = RowsTable(box, height, lambda: table_changed(), on_pick)
     for w in (text_frame, table.frame):
         w.grid(row=1, column=0, sticky="nsew")
     table.frame.grid_remove()
-    state = {"table": False}  # whether the table is showing
+    # table: whether the table is showing; text: the text that table.rows matches
+    state = {"table": False, "text": ""}
 
     foot = ttk.Frame(box)
     foot.grid(row=2, column=0, sticky="ew", pady=(4, 0))
@@ -739,26 +1170,54 @@ def _paste_box(parent, root, on_change, to_table, height=6, on_pick=None):
     def get_text():
         return txt.get("1.0", "end-1c")
 
-    def parsed():
-        try:
-            return parse_pasted(get_text())
-        except csv.Error:
-            return []
-
-    def refresh():
-        if state["table"]:
-            table.set(*to_table(parsed()))
+    def update_info():
+        n = sum(1 for r in table.rows if any(c.strip() for c in r))
+        text = f"{_plural(n, 'row')} pasted" if n else ""
+        if n and state["table"]:
+            text += ". Double-click a value to change it."
+        info.set(text)
+        toggle_btn.state(["!disabled" if get_text().strip() else "disabled"])
 
     def focus():
         (table.tree if state["table"] else txt).focus_set()
 
+    def read_text():
+        """Take the rows from the text, if it is different from the rows held."""
+        text = get_text()
+        if text == state["text"]:
+            return
+        state["text"] = text
+        try:
+            table.load(parse_pasted(text))
+        except csv.Error:
+            table.load([])
+        on_change(False)
+        if state["table"]:
+            table.show(*view())
+
+    def table_changed():
+        """A value was changed or rows were deleted: rewrite the text to match."""
+        out = io.StringIO()
+        csv.writer(out, delimiter="\t", lineterminator="\n").writerows(table.rows)
+        state["text"] = out.getvalue()
+        txt.delete("1.0", "end")
+        txt.insert("1.0", state["text"])
+        on_change(True)
+        table.show(*view(), keep_place=True)
+        update_info()
+
     def show_table(on):
+        table.finish()
+        read_text()
         on = on and bool(get_text().strip())
         state["table"] = on
         (text_frame if on else table.frame).grid_remove()
         (table.frame if on else text_frame).grid()
+        (table_btns.grid if on else table_btns.grid_remove)()
         toggle_btn.configure(text="Edit as text" if on else "Show as table")
-        refresh()
+        if on:
+            table.show(*view())
+        update_info()
         focus()
 
     def paste_clipboard(_=None):
@@ -767,42 +1226,45 @@ def _paste_box(parent, root, on_change, to_table, height=6, on_pick=None):
         except tk.TclError:
             messagebox.showerror(APP_NAME, "The clipboard is empty.\nCopy the cells in Excel first.")
             return
+        table.editor.close(False)
         txt.delete("1.0", "end")
         txt.insert("1.0", data)
         show_table(True)
 
     def clear():
+        table.editor.close(False)
         txt.delete("1.0", "end")
         show_table(False)
 
+    table_btns = table.buttons(foot)
+    table_btns.grid(row=0, column=1, padx=(0, 12))
+    table_btns.grid_remove()
     toggle_btn = ttk.Button(
         foot, text="Show as table", command=lambda: show_table(not state["table"])
     )
-    toggle_btn.grid(row=0, column=1)
+    toggle_btn.grid(row=0, column=2)
     toggle_btn.state(["disabled"])
-    ttk.Button(foot, text="Paste", command=paste_clipboard).grid(row=0, column=2, padx=(6, 0))
-    ttk.Button(foot, text="Clear", command=clear).grid(row=0, column=3, padx=(6, 0))
+    ttk.Button(foot, text="Paste", command=paste_clipboard).grid(row=0, column=3, padx=(6, 0))
+    ttk.Button(foot, text="Clear", command=clear).grid(row=0, column=4, padx=(6, 0))
 
     def modified(_=None):
         if not txt.edit_modified():
             return  # fired by the reset below
         txt.edit_modified(False)
-        n = sum(1 for r in parsed() if any(c.strip() for c in r))
-        info.set(f"{_plural(n, 'row')} pasted" if n else "")
-        toggle_btn.state(["!disabled" if get_text().strip() else "disabled"])
-        on_change()
-        refresh()
+        read_text()
+        update_info()
 
     txt.bind("<<Modified>>", modified)
     txt.bind("<<Paste>>", lambda e: txt.after_idle(show_table, True))
     table.tree.bind("<<Paste>>", paste_clipboard)
-    return box, get_text, refresh, focus, table
+    return box, table, focus
 
 
-def build_home_page(parent, open_page):
+def build_home_page(parent, root, open_page):
+    import tkinter as tk
     from tkinter import ttk
 
-    page_frm = ttk.Frame(parent, padding=24)
+    page_frm = ttk.Frame(parent, padding=_px(24))
     frm = ttk.Frame(page_frm)
     frm.pack(expand=True)  # centred
     ttk.Label(frm, text=APP_NAME, style="AppTitle.TLabel").pack(anchor="w")
@@ -818,6 +1280,16 @@ def build_home_page(parent, open_page):
             fill="x", pady=(8, 0)
         )
         ttk.Label(frm, text=blurb, style="Hint.TLabel").pack(anchor="w", pady=(2, 4))
+    if root.themed:
+        dark = tk.BooleanVar(value=root.dark)
+
+        def switch():
+            root.dark = dark.get()
+            apply_theme(root, root.dark)
+
+        ttk.Checkbutton(
+            page_frm, text="Dark mode", variable=dark, command=switch, style="Switch.TCheckbutton"
+        ).place(relx=1, rely=1, anchor="se")
     return Page(page_frm)
 
 
@@ -836,11 +1308,15 @@ def build_plu_page(parent, root, go_home):
     has_header = tk.BooleanVar(value=False)
     plu_var = tk.StringVar()
     qty_var = tk.StringVar(value="1")
-    # For each input: the rows read, the columns [(index, label)] and rows below the header
-    # found in them, and the index of the PLU column (None: not chosen)
-    sources = {m: {"rows": [], "columns": [], "body": [], "plu": None} for m in ("file", "paste")}
-    # path: the file the preview shows; error: why it couldn't be read
-    preview = {"path": "", "error": "", "timer": None}
+    # For each input: the columns [(index, label)] and rows below the header [(row index,
+    # row)] found, and the index of the PLU column (None: not chosen)
+    # header: whether it has a header row; detected: whether a PLU heading was found
+    sources = {
+        m: {"columns": [], "body": [], "plu": None, "header": False, "detected": False}
+        for m in ("file", "paste")
+    }
+    # path: the file the preview shows; stamp: its version; error: why it couldn't be read
+    preview = {"path": "", "stamp": None, "error": "", "timer": None}
 
     def auto_output():
         """The output path suggested for the current input ('' if there isn't one)."""
@@ -854,19 +1330,22 @@ def build_plu_page(parent, root, go_home):
     src_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
 
     # --- PLU column
-    def set_rows(which, rows):
-        """Take new rows for an input, going back to the assumed PLU column."""
-        src = sources[which]
-        src["rows"] = rows
-        src["columns"], src["body"], src["plu"] = plu_table(rows, has_header.get())
+    def table_of(which):
+        return file_rows if which == "file" else paste_rows
 
-    def to_table(which):
-        """The preview of an input."""
+    def find_columns(which, keep_plu=False):
+        """Work out an input's columns, going back to the assumed PLU column."""
+        src, chosen = sources[which], sources[which]["plu"]
+        src["columns"], src["body"], src["plu"] = plu_table(table_of(which).rows, src["header"])
+        if keep_plu and any(i == chosen for i, _ in src["columns"]):
+            src["plu"] = chosen
+
+    def view(which):
+        """The preview of an input, as RowsTable.show arguments."""
         src = sources[which]
         return (
-            [label for _, label in src["columns"]],
-            [[_cell(r, i) for i, _ in src["columns"]] for r in src["body"]],
-            plu_position(which),
+            [label for _, label in src["columns"]], [i for i, _ in src["body"]],
+            [i for i, _ in src["columns"]], plu_position(which),
         )
 
     def plu_position(which):
@@ -881,13 +1360,15 @@ def build_plu_page(parent, root, go_home):
         show_plu()
 
     def show_plu():
-        """Update the dropdown, the mark in the preview and the Convert button."""
+        """Update the options, the mark in the preview and the Convert button."""
         which = mode.get()
+        has_header.set(sources[which]["header"])
+        header_info.configure(text="PLU heading found" if sources[which]["detected"] else "")
         labels = [label for _, label in sources[which]["columns"]]
         position = plu_position(which)
         plu_box.configure(values=labels, state="readonly" if labels else "disabled")
         plu_var.set("" if position is None else labels[position])
-        (file_rows if which == "file" else paste_rows).mark(position)
+        table_of(which).mark(position)
         update_ready()
 
     # --- file input
@@ -911,31 +1392,60 @@ def build_plu_page(parent, root, go_home):
     in_entry = ttk.Entry(file_box, textvariable=in_var, width=48)
     in_entry.grid(row=0, column=1, sticky="ew", padx=6)
     ttk.Button(file_box, text="Browse…", command=browse_input).grid(row=0, column=2)
-    file_rows = RowsTable(file_box, on_pick=pick)
+    file_rows = RowsTable(file_box, 6, lambda: file_edited(), pick)
     file_rows.frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-    file_info = ttk.Label(file_box)
-    file_info.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    file_foot = ttk.Frame(file_box)
+    file_foot.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+    file_foot.columnconfigure(0, weight=1)
+    file_info = ttk.Label(file_foot)
+    file_info.grid(row=0, column=0, sticky="w")
+    file_rows.buttons(file_foot).grid(row=0, column=1)
+
+    def show_file_info():
+        text, style = preview["error"], "Warn.TLabel"
+        if not text:
+            style = "Hint.TLabel"
+            if os.path.isfile(preview["path"]):
+                text = (
+                    f"{_plural(len(file_rows.rows), 'row')} in the preview. "
+                    "Double-click a value to change it (the file itself isn't changed)."
+                )
+            elif root.can_drop:
+                text = "You can also drop a file onto this window."
+        file_info.configure(text=text, style=style)
+
+    def file_stamp(path):
+        try:
+            info = os.stat(path)
+        except OSError:
+            return None
+        return info.st_mtime_ns, info.st_size
+
+    def file_edited():
+        find_columns("file", keep_plu=True)
+        file_rows.show(*view("file"), keep_place=True)
+        show_file_info()
+        show_plu()
 
     def load_preview():
         """Read the chosen file and show its rows."""
         if preview["timer"]:
             root.after_cancel(preview["timer"])
         path = in_var.get().strip()
-        rows, error, text = [], "", ""
+        rows, error, stamp = [], "", file_stamp(path)
         if os.path.isfile(path):
             try:
                 rows = [r for r in read_rows(path) if any(str(c).strip() for c in r)]
-                text = f"{_plural(len(rows), 'row')} found in the file."
             except PermissionError:
                 error = "Could not open the file. Is it open in Excel?"
             except Exception as e:  # noqa: BLE001
                 error = f"Could not read the file: {_one_line(e)}"
-        elif root.can_drop:
-            text = "You can also drop a file onto this window."
-        preview.update(path=path, error=error, timer=None)
-        file_info.configure(text=error or text, style="Warn.TLabel" if error else "Hint.TLabel")
-        set_rows("file", rows)
-        file_rows.set(*to_table("file"))
+        preview.update(path=path, stamp=stamp, error=error, timer=None)
+        file_rows.load(rows)
+        sources["file"]["header"] = sources["file"]["detected"] = has_plu_header(rows)
+        find_columns("file")
+        file_rows.show(*view("file"))
+        show_file_info()
         show_plu()
 
     def input_changed(*_):
@@ -946,16 +1456,15 @@ def build_plu_page(parent, root, go_home):
         update_ready()
 
     # --- paste input
-    def on_paste_change():
-        try:
-            rows = parse_pasted(pasted_text())
-        except csv.Error:
-            rows = []
-        set_rows("paste", rows)
+    def on_paste_change(edited):
+        src, found = sources["paste"], has_plu_header(paste_rows.rows)
+        if not edited and found != src["detected"]:  # otherwise keep the user's choice
+            src["header"] = src["detected"] = found
+        find_columns("paste", keep_plu=edited)
         show_plu()
 
-    paste_box, pasted_text, refresh_paste, focus_paste, paste_rows = _paste_box(
-        body, root, on_paste_change, lambda rows: to_table("paste"), on_pick=pick
+    paste_box, paste_rows, focus_paste = _paste_box(
+        body, root, on_paste_change, lambda: view("paste"), on_pick=pick
     )
 
     def switch_mode():
@@ -985,22 +1494,27 @@ def build_plu_page(parent, root, go_home):
 
     # --- options
     def header_changed():
-        for which, src in sources.items():
-            set_rows(which, src["rows"])
-        file_rows.set(*to_table("file"))
-        refresh_paste()
+        which = mode.get()
+        table_of(which).finish()
+        sources[which]["header"] = has_header.get()
+        find_columns(which)
+        table_of(which).show(*view(which))
         show_plu()
 
+    header_row = ttk.Frame(body)
+    header_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
     ttk.Checkbutton(
-        body, text="Data has a header row", variable=has_header, command=header_changed
-    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        header_row, text="Data has a header row", variable=has_header, command=header_changed
+    ).pack(side="left")
+    header_info = ttk.Label(header_row, style="Hint.TLabel")
+    header_info.pack(side="left", padx=8)
     ttk.Label(body, text="PLU column:").grid(row=4, column=0, sticky="w", pady=(8, 0))
     plu_row = ttk.Frame(body)
     plu_row.grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(8, 0))
     plu_box = ttk.Combobox(plu_row, textvariable=plu_var, state="disabled", width=30, height=15)
     plu_box.pack(side="left")
     plu_box.bind("<<ComboboxSelected>>", lambda e: pick(plu_box.current()))
-    ttk.Label(plu_row, text="or click a column in the preview", style="Hint.TLabel").pack(
+    ttk.Label(plu_row, text="or click a column heading in the preview", style="Hint.TLabel").pack(
         side="left", padx=8
     )
     ttk.Label(body, text="QTY:").grid(row=5, column=0, sticky="w", pady=(8, 0))
@@ -1043,9 +1557,22 @@ def build_plu_page(parent, root, go_home):
 
     # --- action + result
     def convert():
+        table = table_of(mode.get())
+        table.finish()
+        if update_ready():
+            return  # the value just changed left nothing to convert
         qty = qty_var.get().strip()
         pasting = mode.get() == "paste"
-        text, src = pasted_text(), in_var.get().strip()
+        src = in_var.get().strip()
+        if not pasting and file_stamp(src) != preview["stamp"]:
+            if messagebox.askyesno(
+                APP_NAME,
+                "The file has changed since it was opened here.\nLoad it again"
+                + (" (the changes you made in the preview will be lost)" if table.undo_steps else "")
+                + "?\n\nChoose No to convert what the preview shows.",
+            ):
+                load_preview()
+                return
         plu_col = sources[mode.get()]["plu"]
 
         out = out_var.get().strip()
@@ -1071,12 +1598,10 @@ def build_plu_page(parent, root, go_home):
             return
 
         try:
-            if pasting:
-                n, skipped = extract_rows(
-                    parse_pasted(text), out, has_header.get(), qty, plu_col, source="pasted data"
-                )
-            else:
-                n, skipped = extract(src, out, has_header.get(), qty, plu_col)
+            n, skipped = extract_rows(
+                table.rows, out, sources[mode.get()]["header"], qty, plu_col,
+                source="pasted data" if pasting else "file",
+            )
         except ExtractError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
@@ -1100,7 +1625,7 @@ def build_plu_page(parent, root, go_home):
         src = in_var.get().strip()
         reason = ""
         if mode.get() == "paste":
-            if not pasted_text().strip():
+            if not sources["paste"]["columns"]:
                 reason = "Paste the cells from Excel"
         elif not src:
             reason = "Choose an input file"
@@ -1111,7 +1636,7 @@ def build_plu_page(parent, root, go_home):
         elif preview["error"]:
             reason = "The file could not be read"
         elif not sources["file"]["columns"]:
-            reason = "The file is empty"
+            reason = "There are no rows"
         if not reason and sources[mode.get()]["plu"] is None:
             reason = "Choose the PLU column"
         if not reason:
@@ -1121,6 +1646,7 @@ def build_plu_page(parent, root, go_home):
             except ValueError:
                 reason = "QTY must be a number"
         set_reason(reason)
+        return reason
 
     in_var.trace_add("write", input_changed)
     qty_var.trace_add("write", update_ready)
@@ -1180,25 +1706,26 @@ def build_bw_page(parent, root, go_home, go_next):
     list_box.columnconfigure(0, weight=1)
     list_box.rowconfigure(0, weight=1)
     tree = ttk.Treeview(
-        list_box, columns=("check", "section", "supplier", "items"), show="headings", height=8,
-        selectmode="none",
+        list_box, columns=("check", "section", "supplier", "items"), height=8, selectmode="none",
+        displaycolumns=("section", "supplier", "items"),
     )
-    tree.heading("check", text="")
+    _check_column(tree, root, lambda: set_all(not state["shown"] or not all_shown_selected()))
     headings = {"section": ("Section", "w"), "supplier": ("Supplier", "w"), "items": ("Items", "center")}
-    tree.column("check", width=36, minwidth=36, stretch=False, anchor="center")
-    tree.column("section", width=420, anchor="w")
-    tree.column("supplier", width=170, stretch=False, anchor="w")
-    tree.column("items", width=80, stretch=False, anchor="center")
+    tree.column("section", width=_px(420), minwidth=_px(120), anchor="w")
+    tree.column("supplier", width=_px(170), minwidth=_px(60), stretch=False, anchor="w")
+    tree.column("items", width=_px(80), minwidth=_px(60), stretch=False, anchor="center")
     tree.grid(row=0, column=0, sticky="nsew")
-    tree_scroll = ttk.Scrollbar(list_box, orient="vertical", command=tree.yview)
-    tree_scroll.grid(row=0, column=1, sticky="ns")
-    tree.configure(yscrollcommand=tree_scroll.set)
-    tree.tag_configure("on", background="#e6f0fb")
+    _scrollbar(tree, "vertical", 0, 1)
+    root.on_theme.append(lambda colors: tree.tag_configure("on", background=colors["on"]))
 
     def refresh_row(idx):
         on = idx in state["selected"]
-        tree.set(str(idx), "check", CHECKED if on else UNCHECKED)
-        tree.item(str(idx), tags=("on",) if on else ())
+        box = CHECKED if on else UNCHECKED
+        tree.set(str(idx), "check", box)
+        tree.item(str(idx), image=root.checks[box], tags=("on",) if on else ())
+
+    def all_shown_selected():
+        return state["selected"].issuperset(state["shown"])
 
     def update_sel_info():
         secs, sel = state["sections"], state["selected"]
@@ -1207,7 +1734,15 @@ def build_bw_page(parent, root, go_home, go_next):
             set_reason("Choose a flight file")
             return
         items = sum(len(secs[i].items) for i in sel)
-        hidden = len(sel - set(state["shown"]))
+        shown = set(state["shown"])
+        hidden = len(sel - shown)
+        if not shown:
+            box = BLOCKED
+        elif all_shown_selected():
+            box = CHECKED
+        else:
+            box = PARTLY if sel & shown else UNCHECKED
+        tree.heading("#0", image=root.heading_checks[box])
         sel_info.set(
             f"{len(sel)} of {_plural(len(secs), 'section')} selected"
             + (f" ({_plural(items, 'item')})" if sel else "")
@@ -1225,11 +1760,7 @@ def build_bw_page(parent, root, go_home, go_next):
         if col == "items":
             return len(section.items)
         text = section.title if col == "section" else section_supplier(section)
-        # Numbers in the text sort by value, so 'BREAK 9' comes before 'BREAK 24A'
-        return [
-            (0, int(part), "") if part.isdecimal() else (1, 0, part)
-            for part in re.split(r"(\d+)", text.upper()) if part
-        ]
+        return _natural_key(text)
 
     def passes_filter(section):
         supplier = supplier_var.get()
@@ -1264,7 +1795,7 @@ def build_bw_page(parent, root, go_home, go_next):
         if tree.identify_region(event.x, event.y) == "heading":
             return None  # let the heading handle it (sorts the list)
         row = tree.identify_row(event.y)
-        if row and tree.identify_region(event.x, event.y) == "cell":
+        if row and tree.identify_region(event.x, event.y) in ("cell", "tree"):
             tree.focus(row)
             tree.focus_set()
             toggle(int(row))
@@ -1367,8 +1898,9 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     planogram_var = tk.StringVar()
     threshold_var = tk.StringVar(value="0")
     state = {
-        "file_table": None,  # StockTable from the chosen file
-        "paste_table": None,  # StockTable from the pasted cells
+        "file": None,  # StockTable from the chosen file
+        "paste": None,  # StockTable from the pasted cells
+        "file_error": "",
         "paste_error": "",
     }
 
@@ -1379,15 +1911,30 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     src_row = ttk.Frame(body)
     src_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(10, 0))
 
-    def table_rows(table):
-        """What to show for a StockTable: the labelled columns, in report order."""
+    def table_of(which):
+        return file_rows if which == "file" else paste_rows
+
+    def parse(which):
+        """Read the items from an input's rows."""
+        state[which], state[which + "_error"] = None, ""
+        rows = table_of(which).rows
+        if any(any(str(c).strip() for c in r) for r in rows):
+            try:
+                state[which] = parse_stock_rows(rows, "preview" if which == "file" else "pasted data")
+            except ExtractError as e:
+                state[which + "_error"] = str(e)
+        elif which == "file" and in_var.get():
+            state["file_error"] = "All the rows have been deleted."
+
+    def view(which):
+        """The labelled columns of an input's items, in report order, as RowsTable.show arguments."""
+        table = state[which]
+        if table is None:
+            return _raw_table(table_of(which).rows)
         cols = {table.plu_col: TARGET_HEADER, table.soh_col: SOH_HEADER}
         cols.update((ci, label) for label, ci in table.columns.items())
         order = sorted(cols)
-        return (
-            [cols[c] for c in order],
-            [[_cell(row, c) for c in order] for row in table.rows.values()],
-        )
+        return [cols[c] for c in order], [i for i, _ in table.body], order
 
     file_box = ttk.Frame(body)
     file_box.columnconfigure(1, weight=1)
@@ -1395,8 +1942,19 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     ttk.Label(file_box, text="Stock file:").grid(row=0, column=0, sticky="w")
     in_entry = _path_entry(file_box, in_var)
     in_entry.grid(row=0, column=1, sticky="ew", padx=6)
-    file_rows = RowsTable(file_box, height=5)
+    file_rows = RowsTable(file_box, 5, lambda: file_edited())
     file_rows.frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+    file_foot = ttk.Frame(file_box)
+    file_foot.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+    file_foot.columnconfigure(0, weight=1)
+    file_hint = ttk.Label(file_foot, style="Hint.TLabel")
+    file_hint.grid(row=0, column=0, sticky="w")
+    file_rows.buttons(file_foot).grid(row=0, column=1)
+
+    def file_edited():
+        parse("file")
+        file_rows.show(*view("file"), keep_place=True)
+        refresh_table()
 
     def browse_input():
         path = filedialog.askopenfilename(title="Select the stock report", filetypes=FILE_TYPES)
@@ -1405,7 +1963,8 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
 
     def load(path):
         try:
-            table = parse_stock_rows(read_rows(path))
+            rows = read_rows(path)
+            parse_stock_rows(rows)
         except ExtractError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
@@ -1417,27 +1976,23 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
             return
         in_var.set(os.path.normpath(path))
         _show_end(in_entry)
-        state["file_table"] = table
-        file_rows.set(*table_rows(table))
+        file_rows.load(rows)
+        parse("file")
+        file_rows.show(*view("file"))
+        file_hint.configure(
+            text="Double-click a value to change it (the file itself isn't changed)."
+        )
         mode.set("file")
         switch_mode()
 
     ttk.Button(file_box, text="Browse…", command=browse_input).grid(row=0, column=2)
 
-    def on_paste_change():
-        state["paste_table"], state["paste_error"] = None, ""
-        text = pasted_text()
-        if text.strip():
-            try:
-                state["paste_table"] = parse_stock_rows(parse_pasted(text), "pasted data")
-            except (ExtractError, csv.Error) as e:
-                state["paste_error"] = str(e)
+    def on_paste_change(_):
+        parse("paste")
         refresh_table()
 
-    paste_box, pasted_text, _, focus_paste, _ = _paste_box(
-        body, root, on_paste_change,
-        lambda rows: table_rows(state["paste_table"]) if state["paste_table"] else _raw_table(rows),
-        height=5,
+    paste_box, paste_rows, focus_paste = _paste_box(
+        body, root, on_paste_change, lambda: view("paste"), height=5
     )
 
     for box in (file_box, paste_box):
@@ -1445,7 +2000,7 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     paste_box.grid_remove()
 
     def current_table():
-        return state["file_table"] if mode.get() == "file" else state["paste_table"]
+        return state[mode.get()]
 
     def switch_mode():
         if mode.get() == "file":
@@ -1487,12 +2042,10 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         """Show the current stock report's item count and its columns to pick from."""
         table = current_table()
         if table is None:
-            if mode.get() == "paste":
-                stock_info.set(state["paste_error"])
-            else:
-                stock_info.set(
-                    "You can also drop the file onto this window." if root.can_drop else ""
-                )
+            text = state[mode.get() + "_error"]
+            if not text and mode.get() == "file" and root.can_drop:
+                text = "You can also drop the file onto this window."
+            stock_info.set(text)
             planogram_box.configure(values=(), state="disabled")
             planogram_var.set("")
         else:
@@ -1509,21 +2062,26 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         table, reason = current_table(), ""
         if table is None:
             reason = "Choose a stock report file" if mode.get() == "file" else "Paste the stock report"
+            if state[mode.get() + "_error"]:
+                reason = "The stock report has no items to use"
         elif planogram_var.get() not in table.columns:
             reason = "Select the planogram column"
         threshold = threshold_var.get().strip()
         if not reason and (not threshold or _to_number(threshold) is None):
             reason = "Threshold must be a number"
         set_reason(reason)
+        return reason
 
-    run, set_reason = _footer(
-        frm, "Next →",
-        lambda: go_next(
+    def next_page():
+        table_of(mode.get()).finish()
+        if update_ready():
+            return  # the value just changed left nothing to use
+        go_next(
             current_table(), planogram_var.get(), _to_number(threshold_var.get()),
             in_var.get() if mode.get() == "file" else "",
-        ),
-        go_back,
-    )
+        )
+
+    run, set_reason = _footer(frm, "Next →", next_page, go_back)
     for var in (planogram_var, threshold_var):
         var.trace_add("write", update_ready)
     refresh_table()
@@ -1545,8 +2103,9 @@ def build_bw_review_page(parent, root, go_home, go_back):
 
     frm, body = _page(parent, "Process B&W Flight", go_home, step=2)
     body.columnconfigure(0, weight=1)
-    body.rowconfigure(1, weight=1)
+    body.rowconfigure(2, weight=1)
 
+    ALL_SECTIONS = "All sections"
     FILTERS = {
         "order": ("To order", lambda i: i.status == ORDER or i.include),
         "not needed": ("Not needed", lambda i: i.status == NOT_NEEDED),
@@ -1558,11 +2117,16 @@ def build_bw_review_page(parent, root, go_home, go_back):
     out_var = tk.StringVar()
     total_var = tk.StringVar()
     hint_var = tk.StringVar()
+    search_var = tk.StringVar()
+    section_var = tk.StringVar(value=ALL_SECTIONS)
+    group_var = tk.BooleanVar(value=True)
     HINT = "Click a box to include or leave out an item. Click an order quantity to change it."
     state = {
         "flight": "", "sections": [], "inputs": None, "items": [],
         "sources": [],  # input files, which must not be overwritten
-        "editor": None,  # (entry widget, item index) while a quantity is being changed
+        "shown": [],  # indexes of the items that pass the filters
+        "collapsed": set(),  # indexes of the sections whose items are folded away
+        "sort": (None, False),  # column or None (as in the flight), descending
     }
 
     # --- filter
@@ -1576,41 +2140,57 @@ def build_bw_review_page(parent, root, go_home, go_back):
         )
         filter_btns[name].pack(side="left", padx=(0, 12))
 
+    find_row = ttk.Frame(body)
+    find_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+    find_row.columnconfigure(1, weight=1)
+    ttk.Label(find_row, text="Search:").grid(row=0, column=0)
+    search_entry = ttk.Entry(find_row, textvariable=search_var)
+    search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+    search_entry.bind("<Return>", lambda e: "break")  # filter only, don't generate
+    ttk.Label(find_row, text="Section:").grid(row=0, column=2)
+    section_box = ttk.Combobox(
+        find_row, textvariable=section_var, state="readonly", width=32, values=(ALL_SECTIONS,)
+    )
+    section_box.grid(row=0, column=3, padx=(6, 12))
+    ttk.Checkbutton(
+        find_row, text="Group by section", variable=group_var, command=lambda: refresh()
+    ).grid(row=0, column=4)
+
     # --- items list
     list_box = ttk.Frame(body)
-    list_box.grid(row=1, column=0, sticky="nsew")
+    list_box.grid(row=2, column=0, sticky="nsew")
     list_box.columnconfigure(0, weight=1)
     list_box.rowconfigure(0, weight=1)
     columns = (
-        ("check", "", 36, "center"), ("section", "Section", 150, "w"), ("plu", "PLU", 65, "w"),
-        ("desc", "Description", 200, "w"), ("min", "MIN QTY", 65, "center"),
-        ("plano", "Planogram", 75, "center"), ("soh", "SOH", 50, "center"),
-        ("qty", "Order", 60, "center"), ("note", "Notes", 235, "w"),
+        ("check", "", 0, "center"),  # not displayed: the tick box is in column #0
+        ("desc", "Item", 270, "w"), ("section", "Section", 160, "w"),
+        ("plu", "PLU", 75, "w"), ("min", "MIN QTY", 80, "center"),
+        ("plano", "Planogram", 90, "center"), ("soh", "SOH", 60, "center"),
+        ("qty", "Order", 70, "center"), ("note", "Notes", 240, "w"),
     )
     tree = ttk.Treeview(
-        list_box, columns=[c[0] for c in columns], show="headings", height=8, selectmode="browse"
+        list_box, columns=[c[0] for c in columns], height=8, selectmode="browse"
     )
+    _check_column(tree, root, lambda: toggle_items(state["shown"]))
     for name, label, width, anchor in columns:
-        tree.heading(name, text=label, anchor=anchor)
-        tree.column(name, width=width, minwidth=36, stretch=name == "note", anchor=anchor)
+        tree.heading(name, text=label, anchor=anchor, command=lambda c=name: sort_by(c))
+        tree.column(
+            name, width=_px(width), minwidth=_px(40), stretch=name in ("desc", "note"), anchor=anchor
+        )
     tree.grid(row=0, column=0, sticky="nsew")
-    ys = ttk.Scrollbar(list_box, orient="vertical", command=tree.yview)
-    ys.grid(row=0, column=1, sticky="ns")
-    xs = ttk.Scrollbar(list_box, orient="horizontal", command=tree.xview)
-    xs.grid(row=1, column=0, sticky="ew")
+    # An open entry doesn't scroll with the list, so close it
+    _scrollbar(tree, "vertical", 0, 1, lambda: finish_edit())
+    _scrollbar(tree, "horizontal", 1, 0, lambda: finish_edit())
 
-    def scrolled(bar, *pos):
-        bar.set(*pos)
-        finish_edit()  # the entry doesn't scroll with the list
+    def recolor(colors):
+        tree.tag_configure("on", background=colors["on"])
+        tree.tag_configure("off", foreground=colors["off"])
+        tree.tag_configure("section", background=colors["section"], font=("Segoe UI", 10, "bold"))
 
-    tree.configure(
-        yscrollcommand=lambda *p: scrolled(ys, *p), xscrollcommand=lambda *p: scrolled(xs, *p)
-    )
-    tree.tag_configure("on", background="#e6f0fb")
-    tree.tag_configure("off", foreground="#80868b")
+    root.on_theme.append(recolor)
 
     info_row = ttk.Frame(body)
-    info_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+    info_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
     info_row.columnconfigure(0, weight=1)
     hint_lbl = ttk.Label(info_row, textvariable=hint_var, style="Hint.TLabel")
     hint_lbl.grid(row=0, column=0, sticky="w")
@@ -1625,24 +2205,74 @@ def build_bw_review_page(parent, root, go_home, go_back):
         if item.qty != item.calculated:
             was = "blank" if item.calculated is None else _format_qty(item.calculated)
             notes.insert(0, f"changed from {was}")
+        indent = "      " if group_var.get() else ""
         return (
-            CHECKED if item.include else UNCHECKED,
-            state["sections"][item.section].title, item.plu, _one_line(item.description),
-            item.min_qty, item.planogram, item.soh,
+            CHECKED if item.include else UNCHECKED, indent + _one_line(item.description),
+            state["sections"][item.section].title, item.plu, item.min_qty, item.planogram, item.soh,
             "" if item.qty is None else _format_qty(item.qty), "; ".join(notes),
         )
 
-    def refresh_row(idx):
+    def draw_row(idx):
         item = state["items"][idx]
-        tree.item(str(idx), values=row_values(item), tags=("on" if item.include else "off",))
+        if tree.exists(str(idx)):
+            box = CHECKED if item.include else BLOCKED if item.qty is None else UNCHECKED
+            tree.item(
+                str(idx), values=row_values(item), image=root.checks[box],
+                tags=("on" if item.include else "off",),
+            )
+
+    def refresh_row(idx):
+        draw_row(idx)
+        refresh_section(state["items"][idx].section)
+
+    def box_items(ids):
+        """Of the items with these indexes: (those a box for them all ticks, those ticked)."""
+        items = [state["items"][i] for i in ids]
+        # The box adds what needs ordering or was given a quantity, not what isn't needed
+        wanted = [
+            i for i in items if i.qty is not None and (i.status == ORDER or i.qty != i.calculated)
+        ]
+        return wanted, [i for i in items if i.include]
+
+    def box_state(ids):
+        wanted, ticked = box_items(ids)
+        if not ticked:
+            return UNCHECKED if wanted else BLOCKED
+        return CHECKED if all(i.include for i in wanted) else PARTLY
+
+    def section_ids(section):
+        """A section's shown items."""
+        return [i for i in state["shown"] if state["items"][i].section == section]
+
+    def refresh_section(section):
+        """Update a section's heading row."""
+        iid = f"s{section}"
+        if not tree.exists(iid):
+            return
+        box = box_state(section_ids(section))
+        items = [i for i in state["items"] if i.section == section]
+        arrow = "▸" if section in state["collapsed"] else "▾"
+        values = dict.fromkeys((c[0] for c in columns), "")
+        values.update(
+            check=box, desc=f"{arrow}  {state['sections'][section].title}",
+            note=f"{sum(i.include for i in items)} of {len(items)} to order",
+        )
+        tree.item(
+            iid, values=list(values.values()), image=root.checks[box], tags=("section",)
+        )
 
     def update_totals():
         items = state["items"]
         for name, (label, test) in FILTERS.items():
             filter_btns[name].configure(text=f"{label} ({sum(1 for i in items if test(i))})")
+        tree.heading("#0", image=root.heading_checks[box_state(state["shown"])])
         chosen = [i for i in items if i.include]
         files = len({i.section for i in chosen})
-        total_var.set(f"{_plural(len(chosen), 'item')} to order in {_plural(files, 'file')}")
+        hidden = sum(1 for i in chosen if not found(i))
+        total_var.set(
+            f"{_plural(len(chosen), 'item')} to order in {_plural(files, 'file')}"
+            + (f", including {hidden} hidden by the search" if hidden else "")
+        )
         if not chosen:
             set_reason("Tick at least one item")
         elif not out_var.get().strip():
@@ -1650,17 +2280,101 @@ def build_bw_review_page(parent, root, go_home, go_back):
         else:
             set_reason("")
 
-    def refresh():
-        """List the items of the chosen filter."""
+    def found(item):
+        """Whether an item passes the search and the section filter."""
+        if section_var.get() != ALL_SECTIONS and section_box.current() - 1 != item.section:
+            return False
+        text = f"{item.plu} {item.description}".upper()
+        return all(word in text for word in search_var.get().upper().split())
+
+    def sort_items(ids):
+        col, descending = state["sort"]
+        if col is None:
+            return ids
+        items, sections = state["items"], state["sections"]
+
+        def key(idx):
+            """None for blanks and non-numbers in number columns, which go last either way."""
+            item = items[idx]
+            if col == "qty":
+                return item.qty
+            if col in ("min", "plano", "soh"):
+                text = {"min": item.min_qty, "plano": item.planogram, "soh": item.soh}[col]
+                return _to_number(text) if text.strip() else None
+            return _natural_key({
+                "desc": item.description, "section": sections[item.section].title,
+                "plu": item.plu, "note": row_values(item)[-1],
+            }[col]) or None
+
+        keys = {i: key(i) for i in ids}
+        blank = [i for i in ids if keys[i] is None]
+        rest = sorted((i for i in ids if keys[i] is not None), key=keys.get, reverse=descending)
+        return rest + blank
+
+    def sort_by(col):
+        prev, descending = state["sort"]
+        state["sort"] = (col, col == prev and not descending)
+        refresh()
+
+    def refresh(*_):
+        """List the items that pass the filters, under their sections if grouped."""
         finish_edit()
         tree.delete(*tree.get_children())
-        test = FILTERS[filter_var.get()][1]
-        for idx, item in enumerate(state["items"]):
-            if test(item):
+        test, grouped = FILTERS[filter_var.get()][1], group_var.get()
+        shown = [i for i, item in enumerate(state["items"]) if test(item) and found(item)]
+        state["shown"] = shown = sort_items(shown)
+        tree.configure(displaycolumns=[
+            c[0] for c in columns if c[0] != "check" and not (grouped and c[0] == "section")
+        ])
+        for name, label, _, anchor in columns:
+            arrow = (" ▼" if state["sort"][1] else " ▲") if name == state["sort"][0] else ""
+            tree.heading(name, text=label + arrow, anchor=anchor)
+
+        def add(ids):
+            for idx in ids:
                 tree.insert("", "end", iid=str(idx))
-                refresh_row(idx)
+                draw_row(idx)
+
+        if grouped:
+            members = {}
+            for idx in shown:
+                members.setdefault(state["items"][idx].section, []).append(idx)
+            for section in sorted(members):
+                tree.insert("", "end", iid=f"s{section}")
+                refresh_section(section)
+                if section not in state["collapsed"]:
+                    add(members[section])
+        else:
+            add(shown)
         tree.yview_moveto(0)
         update_totals()
+
+    def fold(section):
+        """Fold a section's items away, or show them again."""
+        place = tree.yview()[0]
+        state["collapsed"].symmetric_difference_update({section})
+        refresh()
+        tree.update_idletasks()
+        tree.yview_moveto(place)
+        tree.selection_set(f"s{section}")
+        tree.focus(f"s{section}")
+
+    def toggle_items(ids):
+        """Tick or untick several items, as the box for them all would."""
+        finish_edit()
+        wanted, ticked = box_items(ids)
+        tick = any(not i.include for i in wanted)
+        for item in wanted if tick else ticked:
+            item.include = tick
+        hint()
+        for idx in ids:
+            draw_row(idx)
+        for section in {state["items"][idx].section for idx in ids}:
+            refresh_section(section)
+        update_totals()
+
+    def toggle_section(section):
+        toggle_items(section_ids(section))
 
     # --- ticking items and changing quantities
     def toggle(idx):
@@ -1679,47 +2393,15 @@ def build_bw_review_page(parent, root, go_home, go_back):
         if not item.key:
             hint("This item has no PLU in the flight file, so it can't be ordered.", True)
             return
-        tree.see(str(idx))
-        tree.update_idletasks()
-        bbox = tree.bbox(str(idx), "qty")
-        if not bbox:
-            return  # scrolled out of sight sideways
-        x, y, w, h = bbox
-        entry = ttk.Entry(tree, justify="center")
-        entry.insert(0, "" if item.qty is None else _format_qty(item.qty))
-        entry.select_range(0, "end")
-        entry.place(x=x, y=y, width=w, height=h)
-        state["editor"] = (entry, idx)
+        editor.open(str(idx), "qty", "" if item.qty is None else _format_qty(item.qty))
         hint("Type the quantity and press Enter. Clear it to leave the item out.")
 
-        def done(apply):
-            finish_edit(apply)
-            tree.focus_set()
-            return "break"
-
-        def left():
-            # Only if the focus really moved to something else in this window
-            if state["editor"] and state["editor"][0] is entry and root.focus_get() not in (None, entry):
-                finish_edit()
-
-        entry.bind("<Return>", lambda e: done(True))
-        entry.bind("<Tab>", lambda e: done(True))
-        entry.bind("<Escape>", lambda e: done(False))
-        entry.bind("<FocusOut>", lambda e: root.after(50, left))
-        entry.focus_set()
-
-    def finish_edit(apply=True):
-        """Close the quantity entry if it is open. False if it held something unusable."""
-        if state["editor"] is None:
-            return True
-        entry, idx = state["editor"]
-        state["editor"] = None  # first: destroying the entry fires FocusOut
-        text = entry.get().strip()
-        entry.destroy()
+    def edited(iid, _, text):
+        """Take the quantity typed. False if it isn't usable."""
         hint()
-        item = state["items"][idx]
-        if not apply:
+        if text is None:
             return True
+        item = state["items"][int(iid)]
         value = _to_number(text)
         if value is None:
             hint(f"'{text}' isn't a number, so the quantity wasn't changed.", True)
@@ -1730,40 +2412,50 @@ def build_bw_review_page(parent, root, go_home, go_back):
                 item.qty, item.include = value, True
         else:
             item.include = False
-        if tree.exists(str(idx)):
-            refresh_row(idx)
+        refresh_row(int(iid))
         update_totals()
         return True
+
+    editor = CellEditor(tree, edited, "center")
+
+    def finish_edit():
+        """Apply the quantity being changed, if any. False if it isn't usable."""
+        return editor.close()
 
     def on_click(event):
         region = tree.identify_region(event.x, event.y)
         row = tree.identify_row(event.y)
-        if region != "cell" or not row:
+        if region not in ("cell", "tree") or not row:
             return None
         finish_edit()
-        col = columns[int(tree.identify_column(event.x)[1:]) - 1][0]
+        number = int(tree.identify_column(event.x)[1:])
+        col = tree["displaycolumns"][number - 1] if number else "check"
         tree.selection_set(row)
         tree.focus(row)
         tree.focus_set()
-        if col == "check":
+        if row.startswith("s"):
+            (toggle_section if col == "check" else fold)(int(row[1:]))
+        elif col == "check":
             toggle(int(row))
         elif col == "qty":
             start_edit(int(row))
         return "break"
 
-    def on_key(action):
+    def on_key(item_action, section_action):
         def handler(_):
             row = tree.focus()
             if row and tree.exists(row):
-                action(int(row))
+                if row.startswith("s"):
+                    section_action(int(row[1:]))
+                else:
+                    item_action(int(row))
             return "break"
         return handler
 
     tree.bind("<Button-1>", on_click)
-    tree.bind("<space>", on_key(toggle))
-    tree.bind("<Return>", on_key(start_edit))
-    tree.bind("<F2>", on_key(start_edit))
-    tree.bind("<Configure>", lambda e: finish_edit())
+    tree.bind("<space>", on_key(toggle, toggle_section))
+    tree.bind("<Return>", on_key(start_edit, fold))
+    tree.bind("<F2>", on_key(start_edit, fold))
 
     # --- output folder
     def browse_output():
@@ -1777,7 +2469,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
             _show_end(out_entry)
 
     out_row = ttk.Frame(body)
-    out_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+    out_row.grid(row=4, column=0, sticky="ew", pady=(12, 0))
     out_row.columnconfigure(1, weight=1)
     ttk.Label(out_row, text="Output folder:").grid(row=0, column=0, sticky="w")
     out_entry = ttk.Entry(out_row, textvariable=out_var, width=56)
@@ -1797,6 +2489,8 @@ def build_bw_review_page(parent, root, go_home, go_back):
                 break
         else:
             name = "all"
+        search_var.set("")
+        section_var.set(ALL_SECTIONS)
         filter_var.set(name)
         refresh()
 
@@ -1887,6 +2581,8 @@ def build_bw_review_page(parent, root, go_home, go_back):
 
     run, set_reason = _footer(frm, "Generate", generate, go_back)
     out_var.trace_add("write", lambda *_: update_totals())
+    for var in (search_var, section_var):
+        var.trace_add("write", refresh)
     update_totals()
 
     def start(flight, sections, table, planogram, threshold, stock_path):
@@ -1911,11 +2607,18 @@ def build_bw_review_page(parent, root, go_home, go_back):
             items=calculate_orders(sections, table, table.columns[planogram], threshold),
         )
         filter_var.set("order" if any(i.include for i in state["items"]) else "all")
+        state["collapsed"], state["sort"] = set(), (None, False)
+        titles = []
+        for s in sections:
+            same = sum(1 for other in sections[: len(titles)] if other.title == s.title)
+            titles.append(f"{s.title} ({same + 1})" if same else s.title)
+        section_box.configure(values=(ALL_SECTIONS, *titles))
+        section_var.set(ALL_SECTIONS)
+        search_var.set("")
         hint()
         refresh()
         return True
 
-    frm.bind("<Unmap>", lambda e: finish_edit() if e.widget is frm else None)
     return Page(frm, run, go_back, None, start)
 
 
@@ -1940,28 +2643,17 @@ def enable_file_drop(root, widget, on_drop):
 
 def run_gui():
     import tkinter as tk
-    from tkinter import font, messagebox, ttk
+    from tkinter import messagebox, ttk
 
     root = tk.Tk()
     root.withdraw()  # until it is laid out
     root.title(APP_NAME)
     set_window_icon(root)
 
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    style.configure("Ok.TLabel", foreground="#1a7f37")
-    style.configure("Warn.TLabel", foreground="#b3261e")
-    style.configure("Hint.TLabel", foreground="#5f6368")
-    style.configure("Step.TLabel", font=("Segoe UI", 9, "bold"), foreground="#0b57d0")
-    style.configure("AppTitle.TLabel", font=("Segoe UI", 16, "bold"))
-    style.configure("PageTitle.TLabel", font=("Segoe UI", 12, "bold"))
-    style.configure("DialogOk.TLabel", font=("Segoe UI", 12, "bold"), foreground="#1a7f37")
-    style.configure("DialogWarn.TLabel", font=("Segoe UI", 12, "bold"), foreground="#b3261e")
-    style.configure("Big.TButton", font=("Segoe UI", 11), padding=(16, 10))
-    style.configure(
-        "Treeview", rowheight=font.nametofont("TkDefaultFont").metrics("linespace") + 6
-    )
+    global _scale
+    _scale = root.winfo_fpixels("1i") / 96
+    root.on_theme, root.dark = [], False
+    apply_theme(root)
 
     container = ttk.Frame(root)
     container.pack(fill="both", expand=True)
@@ -2000,7 +2692,7 @@ def run_gui():
             show("bw_review")
 
     go_home = lambda: show("home")  # noqa: E731
-    pages["home"] = build_home_page(container, show)
+    pages["home"] = build_home_page(container, root, show)
     pages["plu"] = build_plu_page(container, root, go_home)
     pages["bw"] = build_bw_page(container, root, go_home, open_stock)
     pages["bw_stock"] = build_bw_stock_page(
@@ -2025,13 +2717,14 @@ def run_gui():
     root.bind("<Return>", on_return)
     root.bind("<Escape>", on_escape)
     show("home")
+    apply_theme(root)  # again, for the widgets made since
 
     # One size for all pages, so the buttons stay put when moving between them
     root.update_idletasks()
     screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
-    min_w = min(max(900, pages["plu"].frame.winfo_reqwidth()), screen_w)
+    min_w = min(max(_px(900), pages["plu"].frame.winfo_reqwidth()), screen_w)
     min_h = min(max(p.frame.winfo_reqheight() for p in pages.values()), screen_h - 80)
-    w, h = min(max(1000, min_w), screen_w), min(max(640, min_h), screen_h - 80)
+    w, h = min(max(_px(1060), min_w), screen_w), min(max(_px(700), min_h), screen_h - 80)
     root.minsize(min_w, min_h)
     root.geometry(f"{w}x{h}+{(screen_w - w) // 2}+{max((screen_h - h) // 3, 0)}")
     root.deiconify()
