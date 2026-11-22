@@ -13,11 +13,17 @@ Generate PLU file
 
 Process B&W Flight
   Reads a B&W flight workbook (.xlsx or .csv) and lists its sections, e.g.
-  "HEALTHY BREAK 24A BANANA BOAT", so the user can pick which to process.
+  "HEALTHY BREAK 24A BANANA BOAT", so the user can pick which to process (all
+  are selected to begin with).
   A section starts at a row whose first filled cell is text (the section
   title); a 'MYCHEM ID' row gives the column headers (a section without its
   own header row reuses the previous one); rows starting with a number are
   the section's items.
+
+  The next page takes a stock report (.xlsx/.csv file or pasted cells) with PLU
+  and SOH columns plus a planogram column the user picks. Items are matched on
+  PLU and written to a two-column CSV (PLU, QTY), no header row, when
+      QTY = MIN QTY 770MM + Planogram - SOH  is at least the threshold.
 
 Usage:
   - Double-click the exe and pick a task on the home page, or
@@ -27,6 +33,7 @@ Usage:
 
 import csv
 import datetime
+import math
 import os
 import re
 import sys
@@ -228,6 +235,170 @@ def load_bw_sections(path):
     return sections
 
 
+def section_supplier(section):
+    """The supplier shared by all of the section's items, or 'Mix' if there are several."""
+    names = {}
+    for item in section.items:
+        name = re.sub(r"\s+", " ", item.get("SUPPLIER", "")).strip()
+        if name:
+            names.setdefault(name.upper(), name)
+    if len(names) > 1:
+        return "Mix"
+    return next(iter(names.values()), "")
+
+
+# ---------------------------------------------------------------- B&W order
+SOH_HEADER = "SOH"
+MIN_QTY_PREFIX = "MIN QTY 770"  # matches 'MIN QTY 770M' and 'MIN QTY 770MM'
+
+
+def _plu_key(text):
+    """PLU in the form used for matching: '0654051' and '654051.0' -> '654051'."""
+    text = str(text).strip()
+    if _is_number(text):
+        return text.split(".")[0].lstrip("0") or "0"
+    return text.upper()
+
+
+def _to_number(text):
+    """Number in a cell; blank counts as 0. None if it isn't a number."""
+    text = str(text).strip().replace(",", "")
+    if not text:
+        return 0
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _format_qty(value):
+    return str(int(value)) if value == int(value) else str(value)
+
+
+@dataclass
+class StockTable:
+    plu_col: int
+    soh_col: int
+    columns: dict  # {label: column index}, the columns that could be the planogram
+    rows: dict  # {PLU key: row}
+    conflicts: set = field(default_factory=set)  # PLU keys on several rows that differ
+
+
+def parse_stock_rows(rows, source="file"):
+    """Find the header row (it holds both PLU and SOH) and index the rows below by PLU."""
+    rows = [[str(c).strip() for c in r] for r in rows]
+    if not any(any(r) for r in rows):
+        raise ExtractError(f"The {source} is empty.")
+
+    for ri, row in enumerate(rows):
+        names = [_norm_header(c) for c in row]
+        if TARGET_HEADER in names and SOH_HEADER in names:
+            break
+    else:
+        raise ExtractError(
+            f"No header row with both '{TARGET_HEADER}' and '{SOH_HEADER}' columns "
+            f"was found in the {source}."
+        )
+
+    plu_col, soh_col = names.index(TARGET_HEADER), names.index(SOH_HEADER)
+    columns = {}
+    for ci, cell in enumerate(row):
+        label = re.sub(r"\s+", " ", cell)
+        if not label or ci in (plu_col, soh_col):
+            continue
+        if label in columns:
+            label = f"{label} (column {ci + 1})"
+        columns[label] = ci
+
+    table = StockTable(plu_col, soh_col, columns, {})
+    for row in rows[ri + 1:]:
+        key = _plu_key(_cell(row, plu_col))
+        if not key or key == TARGET_HEADER:
+            continue  # footer, or the header row repeated
+        first = table.rows.setdefault(key, row)
+        if first != row:
+            table.conflicts.add(key)
+    if not table.rows:
+        raise ExtractError(f"No items were found under the '{TARGET_HEADER}' header in the {source}.")
+    return table
+
+
+@dataclass
+class OrderResult:
+    lines: list = field(default_factory=list)  # (PLU, qty) to order
+    below: int = 0  # matched items that didn't reach the threshold
+    skipped: list = field(default_factory=list)  # (PLU, description, reason)
+    notes: list = field(default_factory=list)  # (PLU, description, note), item was still processed
+
+
+def calculate_order(sections, table, planogram_col, threshold):
+    """QTY = MIN QTY 770MM + planogram - SOH, kept when QTY >= threshold.
+
+    A PLU listed more than once is ordered once: its MIN QTYs are added together
+    so that the planogram and SOH are only counted once.
+    """
+    result = OrderResult()
+    wanted = {}  # PLU key -> [PLU, description, total MIN QTY, times listed]
+    for section in sections:
+        for item in section.items:
+            plu, desc = item.get("PLU", "").strip(), item.get("DESCRIPTION", "")
+            key = _plu_key(plu)
+            min_header = next((h for h in item if h.startswith(MIN_QTY_PREFIX)), None)
+            min_qty = _to_number(item[min_header]) if min_header else None
+            if not key:
+                reason = "no PLU in the flight file"
+            elif min_header is None:
+                reason = f"section has no {MIN_QTY_PREFIX}MM column"
+            elif min_qty is None:
+                reason = f"{min_header} is not a number: {item[min_header]}"
+            elif key not in table.rows:
+                reason = "PLU not found in the stock report"
+            else:
+                entry = wanted.setdefault(key, [key if _is_number(plu) else plu, desc, 0, 0])
+                entry[2] += min_qty
+                entry[3] += 1
+                continue
+            result.skipped.append((plu or "(blank)", desc, reason))
+
+    for key, (plu, desc, min_qty, times) in wanted.items():
+        row = table.rows[key]
+        soh, planogram = _cell(row, table.soh_col), _cell(row, planogram_col)
+        bad = next(
+            (f"{name} is not a number: {text}"
+             for name, text in (("SOH", soh), ("planogram", planogram))
+             if _to_number(text) is None),
+            None,
+        )
+        if bad:
+            result.skipped.append((plu, desc, bad))
+            continue
+        if times > 1:
+            result.notes.append(
+                (plu, desc, f"listed {times} times in the flight; MIN QTYs added together")
+            )
+        if key in table.conflicts:
+            result.notes.append(
+                (plu, desc, "on several differing stock report rows; the first was used")
+            )
+        # Rounding hides float noise such as 0.30000000000000004
+        qty = round(min_qty + _to_number(planogram) - _to_number(soh), 6)
+        if qty >= threshold:
+            result.lines.append((plu, _format_qty(qty)))
+        else:
+            result.below += 1
+    return result
+
+
+def write_order(lines, out_path):
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(lines)
+
+
+def default_order_path(flight_path):
+    return os.path.splitext(flight_path)[0] + "_ORDER.csv"
+
+
 # ---------------------------------------------------------------- GUI
 def enable_high_dpi():
     """Tell Windows we render at native DPI so it doesn't bitmap-stretch (blur) the UI."""
@@ -257,14 +428,67 @@ def set_window_icon(root):
         pass
 
 
-def _page_header(frm, title, go_home):
-    """'← Home' button and page title across the top of a task page."""
+def _page_header(frm, title, go_back, label="← Home"):
+    """Back/home button and page title across the top of a task page."""
     from tkinter import ttk
 
     bar = ttk.Frame(frm)
     bar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-    ttk.Button(bar, text="← Home", command=go_home).pack(side="left")
+    ttk.Button(bar, text=label, command=go_back).pack(side="left")
     ttk.Label(bar, text=title, style="PageTitle.TLabel").pack(side="left", padx=12)
+
+
+def _paste_box(parent, root, on_change, height=10):
+    """Box for cells pasted from Excel. Returns (frame, text widget, get_text)."""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    info = tk.StringVar()
+    box = ttk.Frame(parent)
+    box.columnconfigure(0, weight=1)
+    ttk.Label(
+        box, text="Copy the cells in Excel, then click in the box below and press Ctrl+V."
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    txt = tk.Text(
+        box, height=height, width=60, wrap="none", undo=True, relief="solid", borderwidth=1
+    )
+    txt.grid(row=1, column=0, sticky="nsew")
+    scroll = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
+    scroll.grid(row=1, column=1, sticky="ns")
+    txt.configure(yscrollcommand=scroll.set)
+
+    foot = ttk.Frame(box)
+    foot.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+    foot.columnconfigure(0, weight=1)
+    ttk.Label(foot, textvariable=info).grid(row=0, column=0, sticky="w")
+
+    def paste_clipboard():
+        try:
+            data = root.clipboard_get()
+        except tk.TclError:
+            messagebox.showerror(APP_NAME, "The clipboard is empty.\nCopy the cells in Excel first.")
+            return
+        txt.delete("1.0", "end")
+        txt.insert("1.0", data)
+
+    ttk.Button(foot, text="Paste", command=paste_clipboard).grid(row=0, column=1)
+    ttk.Button(foot, text="Clear", command=lambda: txt.delete("1.0", "end")).grid(
+        row=0, column=2, padx=(6, 0)
+    )
+
+    def get_text():
+        return txt.get("1.0", "end-1c")
+
+    def modified(_=None):
+        if not txt.edit_modified():
+            return  # fired by the reset below
+        txt.edit_modified(False)
+        n = sum(1 for r in parse_pasted(get_text()) if any(c.strip() for c in r))
+        info.set(f"{n} row{'s' if n != 1 else ''} pasted" if n else "")
+        on_change()
+
+    txt.bind("<<Modified>>", modified)
+    return box, txt, get_text
 
 
 def build_home_page(parent, open_page):
@@ -278,7 +502,7 @@ def build_home_page(parent, open_page):
         ("plu", "Generate PLU file",
          "Turn an Excel/CSV file or pasted cells into a PLU, QTY CSV."),
         ("bw", "Process B&W Flight",
-         "Open a B&W flight workbook and choose which sections to process."),
+         "Work out what to order for a B&W flight from a stock report."),
     ):
         ttk.Button(frm, text=label, style="Big.TButton", command=lambda p=page: open_page(p)).pack(
             fill="x", pady=(8, 0)
@@ -302,7 +526,6 @@ def build_plu_page(parent, root, go_home):
     has_header = tk.BooleanVar(value=False)
     qty_var = tk.StringVar(value="1")
     status = tk.StringVar()
-    paste_info = tk.StringVar()
     last_out = {"path": None}
 
     def auto_output():
@@ -336,48 +559,7 @@ def build_plu_page(parent, root, go_home):
     ttk.Button(file_box, text="Browse…", command=browse_input).grid(row=0, column=2)
 
     # --- paste input
-    paste_box = ttk.Frame(frm)
-    paste_box.columnconfigure(0, weight=1)
-    ttk.Label(
-        paste_box, text="Copy the cells in Excel, then click in the box below and press Ctrl+V."
-    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-    paste_txt = tk.Text(
-        paste_box, height=10, width=60, wrap="none", undo=True, relief="solid", borderwidth=1
-    )
-    paste_txt.grid(row=1, column=0, sticky="nsew")
-    paste_scroll = ttk.Scrollbar(paste_box, orient="vertical", command=paste_txt.yview)
-    paste_scroll.grid(row=1, column=1, sticky="ns")
-    paste_txt.configure(yscrollcommand=paste_scroll.set)
-
-    paste_foot = ttk.Frame(paste_box)
-    paste_foot.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-    paste_foot.columnconfigure(0, weight=1)
-    ttk.Label(paste_foot, textvariable=paste_info).grid(row=0, column=0, sticky="w")
-
-    def paste_clipboard():
-        try:
-            data = root.clipboard_get()
-        except tk.TclError:
-            messagebox.showerror(APP_NAME, "The clipboard is empty.\nCopy the cells in Excel first.")
-            return
-        paste_txt.delete("1.0", "end")
-        paste_txt.insert("1.0", data)
-
-    ttk.Button(paste_foot, text="Paste", command=paste_clipboard).grid(row=0, column=1)
-    ttk.Button(paste_foot, text="Clear", command=lambda: paste_txt.delete("1.0", "end")).grid(
-        row=0, column=2, padx=(6, 0)
-    )
-
-    def pasted_text():
-        return paste_txt.get("1.0", "end-1c")
-
-    def on_paste_change(_=None):
-        n = sum(1 for r in parse_pasted(pasted_text()) if any(c.strip() for c in r))
-        paste_info.set(f"{n} row{'s' if n != 1 else ''} pasted" if n else "")
-        paste_txt.edit_modified(False)
-        clear_status()
-
-    paste_txt.bind("<<Modified>>", on_paste_change)
+    paste_box, paste_txt, pasted_text = _paste_box(frm, root, lambda: clear_status())
 
     def switch_mode(*_):
         if mode.get() == "file":
@@ -539,7 +721,8 @@ def build_plu_page(parent, root, go_home):
     return frm, convert
 
 
-def build_bw_page(parent, root, go_home):
+def build_bw_page(parent, root, go_home, go_next):
+    """go_next(flight path, chosen sections) opens the stock report page."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -569,14 +752,16 @@ def build_bw_page(parent, root, go_home):
     list_box.grid(row=3, column=0, sticky="nsew")
     list_box.columnconfigure(0, weight=1)
     tree = ttk.Treeview(
-        list_box, columns=("check", "section", "items"), show="headings", height=12,
+        list_box, columns=("check", "section", "supplier", "items"), show="headings", height=12,
         selectmode="none",
     )
     tree.heading("check", text="")
     tree.heading("section", text="Section", anchor="w")
+    tree.heading("supplier", text="Supplier", anchor="w")
     tree.heading("items", text="Items")
     tree.column("check", width=36, minwidth=36, stretch=False, anchor="center")
     tree.column("section", width=420, anchor="w")
+    tree.column("supplier", width=170, anchor="w")
     tree.column("items", width=70, stretch=False, anchor="center")
     tree.grid(row=0, column=0, sticky="nsew")
     tree_scroll = ttk.Scrollbar(list_box, orient="vertical", command=tree.yview)
@@ -651,15 +836,18 @@ def build_bw_page(parent, root, go_home):
             return
         in_var.set(os.path.normpath(path))
         in_entry.after_idle(in_entry.xview_moveto, 1.0)
-        state["sections"], state["selected"] = sections, set()
+        state["sections"] = sections
         tree.delete(*tree.get_children())
         for i, s in enumerate(sections):
-            tree.insert("", "end", iid=str(i), values=(UNCHECKED, s.title, len(s.items)))
+            tree.insert(
+                "", "end", iid=str(i),
+                values=(UNCHECKED, s.title, section_supplier(s), len(s.items)),
+            )
         found_var.set(
             f"{len(sections)} section{'s' if len(sections) != 1 else ''} found. "
-            "Click the sections you want to process:"
+            "Click a section to include or leave it out:"
         )
-        update_sel_info()
+        set_all(True)
         tree.focus_set()
 
     def browse_input():
@@ -677,7 +865,7 @@ def build_bw_page(parent, root, go_home):
     bottom.grid(row=5, column=0, sticky="ew", pady=(16, 0))
     bottom.columnconfigure(0, weight=1)
 
-    def process(event=None):
+    def next_page(event=None):
         if not state["sections"]:
             messagebox.showerror(APP_NAME, "Choose a B&W flight file first.")
             return
@@ -685,20 +873,304 @@ def build_bw_page(parent, root, go_home):
         if not chosen:
             messagebox.showerror(APP_NAME, "Select at least one section to process.")
             return
-        process_bw_sections(chosen)
+        go_next(in_var.get(), chosen)
 
-    def process_bw_sections(chosen):
-        # Placeholder until the processing step is defined.
-        messagebox.showinfo(
-            APP_NAME,
-            "Sections selected for processing:\n\n"
-            + "\n".join(f"•  {s.title} ({len(s.items)} items)" for s in chosen),
+    ttk.Button(bottom, text="Next →", command=next_page, default="active").grid(row=0, column=1)
+    return frm, next_page
+
+
+def build_bw_stock_page(parent, root, go_back):
+    """Stock report page. Returns (frame, Enter action, start(flight path, sections))."""
+    import subprocess
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+    frm = ttk.Frame(parent, padding=16)
+    frm.columnconfigure(1, weight=1)
+    _page_header(frm, "Process B&W Flight: stock report", go_back, "← Back")
+
+    mode = tk.StringVar(value="file")  # "file" or "paste"
+    chosen_info = tk.StringVar()
+    in_var = tk.StringVar()
+    out_var = tk.StringVar()
+    stock_info = tk.StringVar()
+    planogram_var = tk.StringVar()
+    threshold_var = tk.StringVar(value="0")
+    status = tk.StringVar()
+    state = {
+        "flight": "",
+        "sections": [],
+        "file_table": None,  # StockTable from the chosen file
+        "paste_table": None,  # StockTable from the pasted cells
+        "paste_error": "",
+        "result": None,
+        "out": None,
+    }
+
+    ttk.Label(frm, textvariable=chosen_info).grid(row=1, column=0, columnspan=3, sticky="w")
+
+    # --- stock report source
+    ttk.Label(frm, text="Stock report:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+    src_row = ttk.Frame(frm)
+    src_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(10, 0))
+
+    file_box = ttk.Frame(frm)
+    file_box.columnconfigure(1, weight=1)
+    ttk.Label(file_box, text="Stock file:").grid(row=0, column=0, sticky="w")
+    in_entry = ttk.Entry(file_box, textvariable=in_var, width=56, state="readonly")
+    in_entry.grid(row=0, column=1, sticky="ew", padx=6)
+
+    def browse_input():
+        path = filedialog.askopenfilename(
+            title="Select the stock report",
+            filetypes=[("Excel or CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")],
         )
+        if path:
+            load(path)
 
-    ttk.Button(bottom, text="Process selected", command=process, default="active").grid(
-        row=0, column=1
+    def load(path):
+        try:
+            table = parse_stock_rows(read_rows(path))
+        except ExtractError as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        except PermissionError:
+            messagebox.showerror(APP_NAME, "Could not open the file.\nIs it open in Excel?")
+            return
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Could not read the file:\n{e}")
+            return
+        in_var.set(os.path.normpath(path))
+        in_entry.after_idle(in_entry.xview_moveto, 1.0)
+        state["file_table"] = table
+        refresh_table()
+
+    ttk.Button(file_box, text="Browse…", command=browse_input).grid(row=0, column=2)
+
+    def on_paste_change():
+        state["paste_table"], state["paste_error"] = None, ""
+        text = pasted_text()
+        if text.strip():
+            try:
+                state["paste_table"] = parse_stock_rows(parse_pasted(text), "pasted data")
+            except ExtractError as e:
+                state["paste_error"] = str(e)
+        refresh_table()
+
+    paste_box, paste_txt, pasted_text = _paste_box(frm, root, on_paste_change, height=8)
+
+    for box in (file_box, paste_box):
+        box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+    paste_box.grid_remove()
+
+    def current_table():
+        return state["file_table"] if mode.get() == "file" else state["paste_table"]
+
+    def switch_mode():
+        if mode.get() == "file":
+            paste_box.grid_remove()
+            file_box.grid()
+        else:
+            file_box.grid_remove()
+            paste_box.grid()
+            paste_txt.focus_set()
+        refresh_table()
+
+    for value, label in (("file", "Select file"), ("paste", "Paste from Excel")):
+        ttk.Radiobutton(
+            src_row, text=label, value=value, variable=mode, command=switch_mode
+        ).pack(side="left", padx=(0, 12))
+
+    ttk.Label(frm, textvariable=stock_info, style="Hint.TLabel").grid(
+        row=4, column=0, columnspan=3, sticky="w", pady=(6, 0)
     )
-    return frm, process
+
+    ttk.Separator(frm).grid(row=5, column=0, columnspan=3, sticky="ew", pady=12)
+
+    # --- calculation
+    ttk.Label(frm, text="Planogram column:").grid(row=6, column=0, sticky="w")
+    planogram_box = ttk.Combobox(
+        frm, textvariable=planogram_var, state="disabled", width=36, height=15
+    )
+    planogram_box.grid(row=6, column=1, sticky="w", padx=6)
+
+    ttk.Label(frm, text="Threshold:").grid(row=7, column=0, sticky="w", pady=(8, 0))
+    ttk.Spinbox(frm, textvariable=threshold_var, from_=-99999, to=99999, increment=1, width=8).grid(
+        row=7, column=1, sticky="w", padx=6, pady=(8, 0)
+    )
+    ttk.Label(
+        frm, text="An item is ordered when  MIN QTY 770MM + Planogram − SOH  ≥  threshold.",
+        style="Hint.TLabel",
+    ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+    def refresh_table():
+        """Show the current stock report's item count and its columns to pick from."""
+        clear_status()
+        table = current_table()
+        if table is None:
+            stock_info.set(state["paste_error"] if mode.get() == "paste" else "")
+            planogram_box.configure(values=(), state="disabled")
+            planogram_var.set("")
+            return
+        n = len(table.rows)
+        stock_info.set(f"{n} item{'s' if n != 1 else ''} found in the stock report.")
+        labels = list(table.columns)
+        planogram_box.configure(values=labels, state="readonly")
+        if planogram_var.get() not in table.columns:
+            likely = [c for c in labels if "PLANOGRAM" in c.upper()]
+            planogram_var.set(likely[0] if len(likely) == 1 else "")
+
+    # --- output file
+    def browse_output():
+        current = out_var.get().strip() or default_order_path(state["flight"])
+        path = filedialog.asksaveasfilename(
+            title="Save order CSV as",
+            initialdir=os.path.dirname(current) or None,
+            initialfile=os.path.basename(current),
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if path:
+            out_var.set(os.path.normpath(path))
+            out_entry.after_idle(out_entry.xview_moveto, 1.0)
+
+    out_row = ttk.Frame(frm)
+    out_row.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    out_row.columnconfigure(1, weight=1)
+    ttk.Label(out_row, text="Output file:").grid(row=0, column=0, sticky="w")
+    out_entry = ttk.Entry(out_row, textvariable=out_var, width=56)
+    out_entry.grid(row=0, column=1, sticky="ew", padx=6)
+    # Keep the file name (end of a long path) visible once the page is laid out
+    out_entry.bind("<Configure>", lambda e: out_entry.after_idle(out_entry.xview_moveto, 1.0))
+    ttk.Button(out_row, text="Save as…", command=browse_output).grid(row=0, column=2)
+
+    # --- action + result
+    bottom = ttk.Frame(frm)
+    bottom.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+    bottom.columnconfigure(0, weight=1)
+    status_lbl = ttk.Label(bottom, textvariable=status, style="Ok.TLabel")
+    status_lbl.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+    def open_folder():
+        if state["out"] and os.path.exists(state["out"]):
+            subprocess.Popen(["explorer", "/select,", state["out"]])
+
+    def show_details():
+        result = state["result"]
+        win = tk.Toplevel(root)
+        win.title(f"{APP_NAME}: details")
+        win.transient(root)
+        box = scrolledtext.ScrolledText(win, width=110, height=24, wrap="none", padx=8, pady=8)
+        box.pack(fill="both", expand=True)
+        for title, entries in (
+            ("Not included in the order", result.skipped),
+            ("Processed, but please check", result.notes),
+        ):
+            if entries:
+                box.insert("end", f"{title} ({len(entries)})\n\n")
+                for plu, desc, why in entries:
+                    box.insert("end", f"{plu:<10} {desc[:44]:<45} {why}\n")
+                box.insert("end", "\n")
+        box.configure(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_set()
+
+    details_btn = ttk.Button(bottom, text="Details…", command=show_details)
+    open_btn = ttk.Button(bottom, text="Open folder", command=open_folder)
+
+    def clear_status(*_):
+        status.set("")
+        details_btn.grid_remove()
+        open_btn.grid_remove()
+
+    # A result stops describing the page once any of its inputs change
+    for var in (planogram_var, threshold_var, out_var):
+        var.trace_add("write", clear_status)
+
+    def generate(event=None):
+        if event is not None and event.widget is paste_txt:
+            return  # Enter in the paste box is a new line, not Generate
+        table = current_table()
+        if table is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Choose a stock report file first." if mode.get() == "file"
+                else state["paste_error"] or "Paste the stock report cells first.",
+            )
+            return
+        if planogram_var.get() not in table.columns:
+            messagebox.showerror(APP_NAME, "Select the planogram column.")
+            return
+        threshold = _to_number(threshold_var.get())
+        if threshold is None or not threshold_var.get().strip():
+            messagebox.showerror(APP_NAME, "Threshold must be a number.")
+            return
+
+        clear_status()
+        result = calculate_order(
+            state["sections"], table, table.columns[planogram_var.get()], threshold
+        )
+        summary = (
+            f"{result.below} below the threshold, {len(result.skipped)} not included"
+            + (f", {len(result.notes)} to check" if result.notes else "")
+        )
+        if result.lines:
+            out = out_var.get().strip()
+            if not out:
+                out = default_order_path(state["flight"])
+                out_var.set(out)
+            inputs = [state["flight"]] + ([in_var.get()] if mode.get() == "file" else [])
+            if any(
+                os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(p))
+                for p in inputs
+            ):
+                messagebox.showerror(
+                    APP_NAME, "The output file can't be the same as an input file."
+                )
+                return
+            if os.path.exists(out) and not messagebox.askyesno(
+                APP_NAME, f"{os.path.basename(out)} already exists.\nReplace it?"
+            ):
+                return
+            try:
+                write_order(result.lines, out)
+            except PermissionError:
+                messagebox.showerror(
+                    APP_NAME, "Could not write the output file.\nIs it open in Excel?"
+                )
+                return
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Could not write the output file:\n{e}")
+                return
+            state["out"] = out
+            n = len(result.lines)
+            status.set(f"Done: {n} item{'s' if n != 1 else ''} to order ({summary}).")
+            status_lbl.configure(style="Ok.TLabel")
+            open_btn.grid(row=1, column=2, padx=(8, 0))
+        else:
+            status.set(f"Nothing to order, so no file was written ({summary}).")
+            status_lbl.configure(style="Warn.TLabel")
+        state["result"] = result
+        if result.skipped or result.notes:
+            details_btn.grid(row=1, column=1)
+
+    ttk.Button(bottom, text="Generate", command=generate, default="active").grid(
+        row=1, column=3, padx=(8, 0)
+    )
+
+    def start(flight, sections):
+        if flight != state["flight"]:
+            out_var.set(os.path.normpath(default_order_path(flight)))
+            out_entry.after_idle(out_entry.xview_moveto, 1.0)
+        state["flight"], state["sections"] = flight, sections
+        n, items = len(sections), sum(len(s.items) for s in sections)
+        chosen_info.set(
+            f"{n} section{'s' if n != 1 else ''} selected from "
+            f"{os.path.basename(flight)} ({items} item{'s' if items != 1 else ''})"
+        )
+        clear_status()
+
+    return frm, generate, start
 
 
 def run_gui():
@@ -714,6 +1186,7 @@ def run_gui():
     if "vista" in style.theme_names():
         style.theme_use("vista")
     style.configure("Ok.TLabel", foreground="#1a7f37")
+    style.configure("Warn.TLabel", foreground="#b3261e")
     style.configure("Hint.TLabel", foreground="#5f6368")
     style.configure("AppTitle.TLabel", font=("Segoe UI", 16, "bold"))
     style.configure("PageTitle.TLabel", font=("Segoe UI", 12, "bold"))
@@ -736,8 +1209,15 @@ def run_gui():
     go_home = lambda: show("home")  # noqa: E731
     pages["home"] = build_home_page(container, show)
     pages["plu"] = build_plu_page(container, root, go_home)
-    pages["bw"] = build_bw_page(container, root, go_home)
-    root.bind("<Escape>", lambda e: go_home())
+
+    def open_stock(flight, sections):
+        start_stock(flight, sections)
+        show("bw_stock")
+
+    pages["bw"] = build_bw_page(container, root, go_home, open_stock)
+    stock_frame, generate, start_stock = build_bw_stock_page(container, root, lambda: show("bw"))
+    pages["bw_stock"] = (stock_frame, generate)
+    root.bind("<Escape>", lambda e: show("bw" if current["name"] == "bw_stock" else "home"))
     show("home")
 
     # Centre on screen (sized for the largest page so switching pages doesn't push it off-screen)
