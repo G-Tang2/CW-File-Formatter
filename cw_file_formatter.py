@@ -24,6 +24,7 @@ Process B&W Flight
   and SOH columns plus a planogram column the user picks. Items are matched on
   PLU and written to a two-column CSV (PLU, QTY), no header row, when
       QTY = MIN QTY 770MM + Planogram - SOH  is at least the threshold.
+  Each selected section gets its own CSV, named after the section.
 
 Usage:
   - Double-click the exe and pick a task on the home page, or
@@ -330,36 +331,36 @@ class OrderResult:
     below: int = 0  # matched items that didn't reach the threshold
     skipped: list = field(default_factory=list)  # (PLU, description, reason)
     notes: list = field(default_factory=list)  # (PLU, description, note), item was still processed
+    matched: dict = field(default_factory=dict)  # {PLU key: (PLU, description)} calculated items
 
 
-def calculate_order(sections, table, planogram_col, threshold):
+def calculate_order(section, table, planogram_col, threshold):
     """QTY = MIN QTY 770MM + planogram - SOH, kept when QTY >= threshold.
 
-    A PLU listed more than once is ordered once: its MIN QTYs are added together
-    so that the planogram and SOH are only counted once.
+    A PLU listed more than once in the section is ordered once: its MIN QTYs are
+    added together so that the planogram and SOH are only counted once.
     """
     result = OrderResult()
     wanted = {}  # PLU key -> [PLU, description, total MIN QTY, times listed]
-    for section in sections:
-        for item in section.items:
-            plu, desc = item.get("PLU", "").strip(), item.get("DESCRIPTION", "")
-            key = _plu_key(plu)
-            min_header = next((h for h in item if h.startswith(MIN_QTY_PREFIX)), None)
-            min_qty = _to_number(item[min_header]) if min_header else None
-            if not key:
-                reason = "no PLU in the flight file"
-            elif min_header is None:
-                reason = f"section has no {MIN_QTY_PREFIX}MM column"
-            elif min_qty is None:
-                reason = f"{min_header} is not a number: {item[min_header]}"
-            elif key not in table.rows:
-                reason = "PLU not found in the stock report"
-            else:
-                entry = wanted.setdefault(key, [key if _is_number(plu) else plu, desc, 0, 0])
-                entry[2] += min_qty
-                entry[3] += 1
-                continue
-            result.skipped.append((plu or "(blank)", desc, reason))
+    for item in section.items:
+        plu, desc = item.get("PLU", "").strip(), item.get("DESCRIPTION", "")
+        key = _plu_key(plu)
+        min_header = next((h for h in item if h.startswith(MIN_QTY_PREFIX)), None)
+        min_qty = _to_number(item[min_header]) if min_header else None
+        if not key:
+            reason = "no PLU in the flight file"
+        elif min_header is None:
+            reason = f"section has no {MIN_QTY_PREFIX}MM column"
+        elif min_qty is None:
+            reason = f"{min_header} is not a number: {item[min_header]}"
+        elif key not in table.rows:
+            reason = "PLU not found in the stock report"
+        else:
+            entry = wanted.setdefault(key, [key if _is_number(plu) else plu, desc, 0, 0])
+            entry[2] += min_qty
+            entry[3] += 1
+            continue
+        result.skipped.append((plu or "(blank)", desc, reason))
 
     for key, (plu, desc, min_qty, times) in wanted.items():
         row = table.rows[key]
@@ -373,9 +374,10 @@ def calculate_order(sections, table, planogram_col, threshold):
         if bad:
             result.skipped.append((plu, desc, bad))
             continue
+        result.matched[key] = (plu, desc)
         if times > 1:
             result.notes.append(
-                (plu, desc, f"listed {times} times in the flight; MIN QTYs added together")
+                (plu, desc, f"listed {times} times in the section; MIN QTYs added together")
             )
         if key in table.conflicts:
             result.notes.append(
@@ -390,13 +392,44 @@ def calculate_order(sections, table, planogram_col, threshold):
     return result
 
 
+def calculate_orders(sections, table, planogram_col, threshold):
+    """One OrderResult per section, each section calculated on its own."""
+    results = [calculate_order(s, table, planogram_col, threshold) for s in sections]
+    # The same planogram and SOH are used for every section a PLU is in: point that out.
+    found_in = {}  # PLU key -> indexes of the sections it was matched in
+    for i, result in enumerate(results):
+        for key in result.matched:
+            found_in.setdefault(key, []).append(i)
+    for key, where in found_in.items():
+        for i in where:
+            others = ", ".join(sections[j].title for j in where if j != i)
+            if others:
+                results[i].notes.append((*results[i].matched[key], f"also in: {others}"))
+    return results
+
+
+def section_file_names(sections):
+    """A distinct CSV file name for each section, e.g. 'HEALTHY BREAK 24A BANANA BOAT.csv'."""
+    names, used = [], set()
+    for section in sections:
+        # Characters Windows doesn't allow in file names
+        base = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", section.title)[:100].strip(" .") or "Section"
+        name, n = base, 1
+        while name.casefold() in used:
+            n += 1
+            name = f"{base} ({n})"
+        used.add(name.casefold())
+        names.append(name + ".csv")
+    return names
+
+
 def write_order(lines, out_path):
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(lines)
 
 
-def default_order_path(flight_path):
-    return os.path.splitext(flight_path)[0] + "_ORDER.csv"
+def default_order_folder(flight_path):
+    return os.path.splitext(flight_path)[0] + "_ORDER"
 
 
 # ---------------------------------------------------------------- GUI
@@ -714,6 +747,9 @@ def build_plu_page(parent, root, go_home):
         last_out["path"] = out
         status.set(f"Done: {n} rows written to {os.path.basename(out)}")
         open_btn.grid(row=0, column=1, padx=(8, 0))
+        messagebox.showinfo(
+            APP_NAME, f"File generated with {n} row{'s' if n != 1 else ''}:\n\n{out}"
+        )
 
     ttk.Button(bottom, text="Convert", command=convert, default="active").grid(
         row=0, column=2, padx=(8, 0)
@@ -733,7 +769,8 @@ def build_bw_page(parent, root, go_home, go_next):
     in_var = tk.StringVar()
     found_var = tk.StringVar(value="Choose a B&W flight file to list its sections.")
     sel_info = tk.StringVar()
-    state = {"sections": [], "selected": set()}  # selected holds indexes into sections
+    # selected holds indexes into sections; sort is (column or None, descending)
+    state = {"sections": [], "selected": set(), "sort": (None, False)}
 
     UNCHECKED, CHECKED = "☐", "☑"
 
@@ -756,9 +793,7 @@ def build_bw_page(parent, root, go_home, go_next):
         selectmode="none",
     )
     tree.heading("check", text="")
-    tree.heading("section", text="Section", anchor="w")
-    tree.heading("supplier", text="Supplier", anchor="w")
-    tree.heading("items", text="Items")
+    headings = {"section": ("Section", "w"), "supplier": ("Supplier", "w"), "items": ("Items", "center")}
     tree.column("check", width=36, minwidth=36, stretch=False, anchor="center")
     tree.column("section", width=420, anchor="w")
     tree.column("supplier", width=170, anchor="w")
@@ -790,7 +825,40 @@ def build_bw_page(parent, root, go_home, go_next):
         refresh_row(idx)
         update_sel_info()
 
+    def sort_key(col, idx):
+        section = state["sections"][idx]
+        if col == "items":
+            return len(section.items)
+        text = section.title if col == "section" else section_supplier(section)
+        # Numbers in the text sort by value, so 'BREAK 9' comes before 'BREAK 24A'
+        return [
+            (0, int(part), "") if part.isdecimal() else (1, 0, part)
+            for part in re.split(r"(\d+)", text.upper()) if part
+        ]
+
+    def show_order(col=None, descending=False):
+        """Order the list by a column, or as in the file (col=None)."""
+        state["sort"] = (col, descending)
+        order = list(range(len(state["sections"])))
+        if col:
+            order.sort(key=lambda i: sort_key(col, i), reverse=descending)
+        for pos, idx in enumerate(order):
+            tree.move(str(idx), "", pos)
+        for name, (label, anchor) in headings.items():
+            arrow = (" ▼" if descending else " ▲") if name == col else ""
+            tree.heading(name, text=label + arrow, anchor=anchor)
+
+    def sort_by(col):
+        prev, descending = state["sort"]
+        show_order(col, col == prev and not descending)
+
+    for name in headings:
+        tree.heading(name, command=lambda c=name: sort_by(c))
+    show_order()
+
     def on_click(event):
+        if tree.identify_region(event.x, event.y) == "heading":
+            return None  # let the heading handle it (sorts the list)
         row = tree.identify_row(event.y)
         if row and tree.identify_region(event.x, event.y) == "cell":
             tree.focus(row)
@@ -845,8 +913,9 @@ def build_bw_page(parent, root, go_home, go_next):
             )
         found_var.set(
             f"{len(sections)} section{'s' if len(sections) != 1 else ''} found. "
-            "Click a section to include or leave it out:"
+            "Click a section to include or leave it out, or a heading to sort:"
         )
+        show_order()
         set_all(True)
         tree.focus_set()
 
@@ -881,7 +950,6 @@ def build_bw_page(parent, root, go_home, go_next):
 
 def build_bw_stock_page(parent, root, go_back):
     """Stock report page. Returns (frame, Enter action, start(flight path, sections))."""
-    import subprocess
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -903,8 +971,8 @@ def build_bw_stock_page(parent, root, go_back):
         "file_table": None,  # StockTable from the chosen file
         "paste_table": None,  # StockTable from the pasted cells
         "paste_error": "",
-        "result": None,
-        "out": None,
+        "results": [],  # (section, OrderResult) pairs from the last run
+        "out": None,  # folder the last run wrote to
     }
 
     ttk.Label(frm, textvariable=chosen_info).grid(row=1, column=0, columnspan=3, sticky="w")
@@ -1020,15 +1088,12 @@ def build_bw_stock_page(parent, root, go_back):
             likely = [c for c in labels if "PLANOGRAM" in c.upper()]
             planogram_var.set(likely[0] if len(likely) == 1 else "")
 
-    # --- output file
+    # --- output folder
     def browse_output():
-        current = out_var.get().strip() or default_order_path(state["flight"])
-        path = filedialog.asksaveasfilename(
-            title="Save order CSV as",
-            initialdir=os.path.dirname(current) or None,
-            initialfile=os.path.basename(current),
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")],
+        current = out_var.get().strip() or default_order_folder(state["flight"])
+        path = filedialog.askdirectory(
+            title="Choose the folder for the order files",
+            initialdir=current if os.path.isdir(current) else os.path.dirname(current) or None,
         )
         if path:
             out_var.set(os.path.normpath(path))
@@ -1037,12 +1102,15 @@ def build_bw_stock_page(parent, root, go_back):
     out_row = ttk.Frame(frm)
     out_row.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
     out_row.columnconfigure(1, weight=1)
-    ttk.Label(out_row, text="Output file:").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        out_row, text="Each section is saved as its own CSV in this folder.", style="Hint.TLabel"
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    ttk.Label(out_row, text="Output folder:").grid(row=0, column=0, sticky="w")
     out_entry = ttk.Entry(out_row, textvariable=out_var, width=56)
     out_entry.grid(row=0, column=1, sticky="ew", padx=6)
-    # Keep the file name (end of a long path) visible once the page is laid out
+    # Keep the folder name (end of a long path) visible once the page is laid out
     out_entry.bind("<Configure>", lambda e: out_entry.after_idle(out_entry.xview_moveto, 1.0))
-    ttk.Button(out_row, text="Save as…", command=browse_output).grid(row=0, column=2)
+    ttk.Button(out_row, text="Browse…", command=browse_output).grid(row=0, column=2)
 
     # --- action + result
     bottom = ttk.Frame(frm)
@@ -1053,23 +1121,33 @@ def build_bw_stock_page(parent, root, go_back):
 
     def open_folder():
         if state["out"] and os.path.exists(state["out"]):
-            subprocess.Popen(["explorer", "/select,", state["out"]])
+            os.startfile(state["out"])
 
     def show_details():
-        result = state["result"]
         win = tk.Toplevel(root)
         win.title(f"{APP_NAME}: details")
         win.transient(root)
         box = scrolledtext.ScrolledText(win, width=110, height=24, wrap="none", padx=8, pady=8)
         box.pack(fill="both", expand=True)
-        for title, entries in (
-            ("Not included in the order", result.skipped),
-            ("Processed, but please check", result.notes),
+        empty = [s.title for s, r in state["results"] if not r.lines]
+        if empty:
+            box.insert("end", f"Sections with nothing to order ({len(empty)})\n\n")
+            box.insert("end", "".join(f"  {title}\n" for title in empty) + "\n")
+        for title, attr in (
+            ("Not included in the order", "skipped"),
+            ("Processed, but please check", "notes"),
         ):
-            if entries:
-                box.insert("end", f"{title} ({len(entries)})\n\n")
+            total = sum(len(getattr(r, attr)) for _, r in state["results"])
+            if not total:
+                continue
+            box.insert("end", f"{title} ({total})\n\n")
+            for section, result in state["results"]:
+                entries = getattr(result, attr)
+                if not entries:
+                    continue
+                box.insert("end", f"  {section.title}\n")
                 for plu, desc, why in entries:
-                    box.insert("end", f"{plu:<10} {desc[:44]:<45} {why}\n")
+                    box.insert("end", f"    {plu:<10} {desc[:44]:<45} {why}\n")
                 box.insert("end", "\n")
         box.configure(state="disabled")
         win.bind("<Escape>", lambda e: win.destroy())
@@ -1107,52 +1185,101 @@ def build_bw_stock_page(parent, root, go_back):
             return
 
         clear_status()
-        result = calculate_order(
-            state["sections"], table, table.columns[planogram_var.get()], threshold
+        sections = state["sections"]
+        results = calculate_orders(
+            sections, table, table.columns[planogram_var.get()], threshold
         )
-        summary = (
-            f"{result.below} below the threshold, {len(result.skipped)} not included"
-            + (f", {len(result.notes)} to check" if result.notes else "")
-        )
-        if result.lines:
-            out = out_var.get().strip()
-            if not out:
-                out = default_order_path(state["flight"])
-                out_var.set(out)
-            inputs = [state["flight"]] + ([in_var.get()] if mode.get() == "file" else [])
-            if any(
-                os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(p))
-                for p in inputs
-            ):
-                messagebox.showerror(
-                    APP_NAME, "The output file can't be the same as an input file."
-                )
-                return
-            if os.path.exists(out) and not messagebox.askyesno(
-                APP_NAME, f"{os.path.basename(out)} already exists.\nReplace it?"
-            ):
-                return
+        folder = out_var.get().strip()
+        if not folder:
+            folder = default_order_folder(state["flight"])
+            out_var.set(folder)
+        paths = [os.path.join(folder, name) for name in section_file_names(sections)]
+        todo = [(path, r) for path, r in zip(paths, results) if r.lines]
+        # Files from an earlier run for sections that now have nothing to order
+        stale = [p for p, r in zip(paths, results) if not r.lines and os.path.exists(p)]
+
+        def plural(n, word):
+            return f"{n} {word}{'' if n == 1 else 's'}"
+
+        def full(path):
+            return os.path.normcase(os.path.abspath(path))
+
+        inputs = [state["flight"]] + ([in_var.get()] if mode.get() == "file" else [])
+        clash = {full(p) for p, _ in todo} & {full(p) for p in inputs}
+        if clash:
+            messagebox.showerror(
+                APP_NAME,
+                "An order file would replace an input file. Choose another output folder.\n\n"
+                + "\n".join(sorted(clash)),
+            )
+            return
+        existing = sum(os.path.exists(p) for p, _ in todo)
+        if existing and not messagebox.askyesno(
+            APP_NAME,
+            f"{plural(existing, 'order file')} already in this folder will be replaced.\n"
+            f"Continue?\n\n{folder}",
+        ):
+            return
+
+        written, failed = [], []  # written: OrderResults; failed: messages
+        if todo:
             try:
-                write_order(result.lines, out)
-            except PermissionError:
-                messagebox.showerror(
-                    APP_NAME, "Could not write the output file.\nIs it open in Excel?"
-                )
-                return
+                os.makedirs(folder, exist_ok=True)
             except OSError as e:
-                messagebox.showerror(APP_NAME, f"Could not write the output file:\n{e}")
+                messagebox.showerror(APP_NAME, f"Could not create the output folder:\n{e}")
                 return
-            state["out"] = out
-            n = len(result.lines)
-            status.set(f"Done: {n} item{'s' if n != 1 else ''} to order ({summary}).")
-            status_lbl.configure(style="Ok.TLabel")
-            open_btn.grid(row=1, column=2, padx=(8, 0))
-        else:
-            status.set(f"Nothing to order, so no file was written ({summary}).")
-            status_lbl.configure(style="Warn.TLabel")
-        state["result"] = result
-        if result.skipped or result.notes:
+        for path, result in todo:
+            try:
+                write_order(result.lines, path)
+                written.append(result)
+            except PermissionError:
+                failed.append(f"{os.path.basename(path)} (is it open in Excel?)")
+            except OSError as e:
+                failed.append(f"{os.path.basename(path)} ({e.strerror or e})")
+
+        state["results"], state["out"] = list(zip(sections, results)), folder
+        empty = sum(not r.lines for r in results)
+        skipped = sum(len(r.skipped) for r in results)
+        notes = sum(len(r.notes) for r in results)
+        summary = (
+            f"{sum(r.below for r in results)} below the threshold, {skipped} not included"
+            + (f", {notes} to check" if notes else "")
+        )
+        done = (
+            f"{plural(len(written), 'file')} generated with "
+            f"{plural(sum(len(r.lines) for r in written), 'item')} to order"
+        )
+        if skipped or notes or empty:
             details_btn.grid(row=1, column=1)
+        if written:
+            open_btn.grid(row=1, column=2, padx=(8, 0))
+        if failed:
+            status.set(f"{done}; {plural(len(failed), 'file')} could not be written.")
+        elif written:
+            status.set(f"Done: {done} ({summary}).")
+        else:
+            status.set(f"Nothing to order, so no files were written ({summary}).")
+        status_lbl.configure(style="Ok.TLabel" if written and not failed else "Warn.TLabel")
+
+        message = f"{done}:\n\n{folder}\n\nItems: {summary}."
+        if empty:
+            message += f"\n\n{plural(empty, 'section')} had nothing to order, so no file was made."
+        if stale:
+            message += (
+                "\n\nOlder files for sections with nothing to order are still in the folder:\n"
+                + "\n".join(os.path.basename(p) for p in stale[:10])
+                + (f"\n…and {len(stale) - 10} more" if len(stale) > 10 else "")
+            )
+        if failed:
+            message += "\n\nCould not be written:\n" + "\n".join(failed[:10]) + (
+                f"\n…and {len(failed) - 10} more" if len(failed) > 10 else ""
+            )
+        if failed:
+            messagebox.showerror(APP_NAME, message)
+        elif written:
+            messagebox.showinfo(APP_NAME, message)
+        elif stale:
+            messagebox.showwarning(APP_NAME, message)
 
     ttk.Button(bottom, text="Generate", command=generate, default="active").grid(
         row=1, column=3, padx=(8, 0)
@@ -1160,7 +1287,7 @@ def build_bw_stock_page(parent, root, go_back):
 
     def start(flight, sections):
         if flight != state["flight"]:
-            out_var.set(os.path.normpath(default_order_path(flight)))
+            out_var.set(os.path.normpath(default_order_folder(flight)))
             out_entry.after_idle(out_entry.xview_moveto, 1.0)
         state["flight"], state["sections"] = flight, sections
         n, items = len(sections), sum(len(s.items) for s in sections)
