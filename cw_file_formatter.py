@@ -41,8 +41,10 @@ Usage:
     of 1; output is written next to the input as <name>_PLU.csv).
 """
 
+import copy
 import csv
 import datetime
+import json
 import math
 import os
 import re
@@ -51,7 +53,59 @@ from dataclasses import dataclass, field
 
 TARGET_HEADER = "PLU"
 APP_NAME = "CW File Formatter"
+APP_VERSION = "2026.11.24"
 ICON_FILE = "icon.ico"
+
+
+# ---------------------------------------------------------------- settings
+# Choices remembered between runs (folders, planogram column, category rules ...), kept
+# in the user's profile so they survive new versions of the exe.
+def _settings_path():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, APP_NAME, "settings.json")
+
+
+_settings = None
+
+
+def _load_settings():
+    global _settings
+    if _settings is None:
+        try:
+            with open(_settings_path(), encoding="utf-8") as f:
+                _settings = json.load(f)
+            if not isinstance(_settings, dict):
+                _settings = {}
+        except (OSError, ValueError):
+            _settings = {}
+    return _settings
+
+
+def get_setting(key, default=None):
+    return copy.deepcopy(_load_settings().get(key, default))
+
+
+def set_setting(key, value):
+    """Remember a value. Saving is best effort: a read-only profile just forgets it."""
+    settings = _load_settings()
+    if settings.get(key) == value:
+        return
+    settings[key] = copy.deepcopy(value)
+    try:
+        path = _settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def remembered_dir(key):
+    """A folder remembered under key, if it still exists (for file dialogs)."""
+    path = get_setting(key)
+    return path if isinstance(path, str) and os.path.isdir(path) else None
 
 
 class ExtractError(Exception):
@@ -295,36 +349,80 @@ def _is_bw_note(text):
     )
 
 
-# Category headings in B&W flight files, in the order they are listed. Other headings
-# that read like categories are grouped under BW_OTHER_CATEGORIES.
-BW_CATEGORIES = [
-    "GONDOLA ENDS", "MESH ENDS", "TILL MESH", "SCRIPTS MESH", "FLOOR STANDS", "MEZZANINE",
-    "FRAGRANCE PODIUM", "WOITW", "P&G SCRIPTS IN PODS 1-12", "OPELLA SCRIPTS OUT PODS 1-12",
-]
+# Category headings in B&W flight files and which of their sections are ticked when a
+# file is opened. The user can change these in the app (Category rules...); these are
+# the defaults. tick: "all", "none" or "grades" (only the grades listed); except: section
+# numbers never ticked ('#5 ...'). Other headings that read like categories are grouped
+# under BW_OTHER_CATEGORIES and not ticked.
+DEFAULT_BW_RULES = {
+    "categories": [
+        {"name": "GONDOLA ENDS", "tick": "all", "grades": "", "except": ""},
+        {"name": "MESH ENDS", "tick": "all", "grades": "", "except": ""},
+        {"name": "TILL MESH", "tick": "all", "grades": "", "except": "5"},
+        {"name": "SCRIPTS MESH", "tick": "all", "grades": "", "except": ""},
+        {"name": "FLOOR STANDS", "tick": "none", "grades": "", "except": ""},
+        {"name": "MEZZANINE", "tick": "none", "grades": "", "except": ""},
+        {"name": "FRAGRANCE PODIUM", "tick": "all", "grades": "", "except": ""},
+        {"name": "WOITW", "tick": "grades", "grades": "D", "except": ""},
+        {"name": "P&G SCRIPTS IN PODS 1-12", "tick": "none", "grades": "", "except": ""},
+        {"name": "OPELLA SCRIPTS OUT PODS 1-12", "tick": "none", "grades": "", "except": ""},
+    ],
+    # Sections whose title starts with one of these are never ticked
+    "skip_titles": ["SELECTED STORES"],
+}
 BW_OTHER_CATEGORIES = "Other categories"
-# Which sections are ticked when a file is opened, by category:
-BW_SELECT_ALL = {"GONDOLA ENDS", "MESH ENDS", "TILL MESH", "SCRIPTS MESH", "FRAGRANCE PODIUM"}
-BW_SKIP_NUMBERS = {"TILL MESH": {5}}  # ...except these section numbers ('#5 ...')
-BW_SELECT_GRADES = {"WOITW": {"D"}}  # ...and these grades ('#48D ...' is grade D)
-BW_SKIP_TITLES = ("SELECTED STORES",)  # sections whose title starts so are never ticked
+BW_TICK_LABELS = {"all": "All sections", "none": "None", "grades": "Only these grades"}
+
+
+def _clean_rules(rules):
+    """Rules as saved, checked and filled in; the defaults if they can't be used."""
+    try:
+        cats = []
+        for c in rules["categories"]:
+            name = re.sub(r"\s+", " ", str(c.get("name", ""))).strip()
+            if name:
+                tick = c.get("tick") if c.get("tick") in BW_TICK_LABELS else "none"
+                cats.append({
+                    "name": name, "tick": tick,
+                    "grades": str(c.get("grades", "")), "except": str(c.get("except", "")),
+                })
+        skip = [str(t).strip() for t in rules.get("skip_titles", []) if str(t).strip()]
+        return {"categories": cats, "skip_titles": skip}
+    except (KeyError, TypeError, AttributeError):
+        return copy.deepcopy(DEFAULT_BW_RULES)
+
+
+def bw_rules():
+    """The category rules in use: the user's, or the defaults."""
+    saved = get_setting("bw_rules")
+    return _clean_rules(saved) if saved else copy.deepcopy(DEFAULT_BW_RULES)
 
 
 def _category_key(text):
-    """'Gondola  Ends:' -> 'GONDOLA ENDS', for comparing headings with BW_CATEGORIES."""
+    """'Gondola  Ends:' -> 'GONDOLA ENDS', for comparing headings with the categories."""
     return re.sub(r"\s+", " ", re.sub(r"[:.\s]+$", "", str(text))).strip().upper()
 
 
-_BW_CATEGORY_KEYS = {_category_key(c): c for c in BW_CATEGORIES}
+def _category_rule(text, rules=None):
+    """The rule for the category a heading names, or None."""
+    key = _category_key(text)
+    if not key:
+        return None
+    for rule in (rules or bw_rules())["categories"]:
+        if _category_key(rule["name"]) == key:
+            return rule
+    return None
 
 
-def _known_category(text):
-    """The BW_CATEGORIES name a heading is, or None."""
-    return _BW_CATEGORY_KEYS.get(_category_key(text))
+def _known_category(text, rules=None):
+    """The category name (as in the rules) a heading is, or None."""
+    rule = _category_rule(text, rules)
+    return rule["name"] if rule else None
 
 
-def bw_group(section):
-    """The category a section is listed under: one of BW_CATEGORIES or BW_OTHER_CATEGORIES."""
-    return _known_category(section.category) or BW_OTHER_CATEGORIES
+def bw_group(section, rules=None):
+    """The category a section is listed under: one from the rules, or BW_OTHER_CATEGORIES."""
+    return _known_category(section.category, rules) or BW_OTHER_CATEGORIES
 
 
 def _section_number_grade(title):
@@ -335,17 +433,45 @@ def _section_number_grade(title):
     return found.group(1), (found.group(2) or "").upper() or None
 
 
-def bw_default_selected(section):
-    """Whether a section is ticked when the file is opened (see BW_SELECT_ALL)."""
-    if section.title.strip().upper().startswith(BW_SKIP_TITLES):
+def bw_default_selected(section, rules=None):
+    """Whether a section is ticked when the file is opened (see DEFAULT_BW_RULES)."""
+    rules = rules or bw_rules()
+    title = section.title.strip().upper()
+    if any(title.startswith(t.upper()) for t in rules["skip_titles"]):
         return False
-    group = bw_group(section)
+    rule = _category_rule(section.category, rules)
+    if rule is None or rule["tick"] == "none":
+        return False
     number, grade = _section_number_grade(section.title)
-    if group in BW_SELECT_ALL:
-        return not (number and int(number) in BW_SKIP_NUMBERS.get(group, ()))
-    if group in BW_SELECT_GRADES:
-        return grade in BW_SELECT_GRADES[group]
-    return False
+    if number and int(number) in {int(n) for n in re.findall(r"\d+", rule["except"])}:
+        return False
+    if rule["tick"] == "grades":
+        return grade is not None and grade in re.findall(r"[A-Z]", rule["grades"].upper())
+    return True
+
+
+_MONTHS = {
+    m.upper(): m[:3] for m in (
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    )
+}
+
+
+def split_section_title(title):
+    """('#1 P&G: ORAL B END', '30 Nov – 13 Dec') for
+    '#1 P&G: ORAL B END to be displayed 30TH NOVEMBER - 13TH DECEMBER'.
+    The dates are '' if the title has no 'to be displayed' part."""
+    found = re.search(r"\s*\bto be displayed\b\s*", title, re.IGNORECASE)
+    if not found or not title[: found.start()].strip():
+        return title.strip(), ""
+    dates = title[found.end():].strip()
+    dates = re.sub(r"(\d+)(ST|ND|RD|TH)\b", r"\1", dates, flags=re.IGNORECASE)
+    dates = re.sub(
+        r"[A-Za-z]+", lambda m: _MONTHS.get(m.group(0).upper(), m.group(0)), dates
+    )
+    dates = re.sub(r"\s*-\s*", " – ", dates)
+    return title[: found.start()].strip(), re.sub(r"\s+", " ", dates).strip()
 
 
 def _is_bw_category(text):
@@ -357,13 +483,13 @@ def _is_bw_category(text):
     )
 
 
-def _pick_bw_title(texts):
+def _pick_bw_title(texts, rules=None):
     """(title, notes, category) from the text rows above a section's items, given as
     (text, above a header row).
 
     The title is the last row that isn't a note; if every row reads like a note, the
     last row is used. The category is the last category-like row before the title
-    ('' if none). A heading from BW_CATEGORIES wins over other category-like rows and
+    ('' if none). A heading from the category rules wins over other category-like rows and
     counts even above a header row ('WOITW'); other rows above a header row are
     banners ('COMPLIANCE ENDS DECEMBER CATALOGUE'), not categories.
     """
@@ -371,11 +497,11 @@ def _pick_bw_title(texts):
     title = (plain or [t for t, _ in texts])[-1]
     at = next(i for i in reversed(range(len(texts))) if texts[i][0] is title)
     notes = [t for t, _ in texts if t is not title and _is_bw_note(t)]
-    if _known_category(title):
-        return title, notes, _known_category(title)  # a category with no section title
-    # Headings from BW_CATEGORIES count wherever they are; other category-like rows
+    if _known_category(title, rules):
+        return title, notes, _known_category(title, rules)  # a category with no section title
+    # Headings from the category rules count wherever they are; other category-like rows
     # only if they are not banners
-    known = [_known_category(t) for t, _ in texts[:at] if _known_category(t)]
+    known = [_known_category(t, rules) for t, _ in texts[:at] if _known_category(t, rules)]
     if known:
         return title, notes, known[-1]
     others = [t for t, banner in texts[:at] if not banner and _is_bw_category(t)]
@@ -394,6 +520,7 @@ def parse_bw_sections(rows):
     sections = []
     current = None
     category = ""
+    rules = bw_rules()
     headers = None  # [(column index, header name)] from the latest header row
     texts = []  # (text, above a header row) for the text rows since the last item
     rows = [[str(c).strip() for c in row] for row in rows]
@@ -418,7 +545,7 @@ def parse_bw_sections(rows):
             continue
 
         if texts:
-            title, notes, new_category = _pick_bw_title(texts)
+            title, notes, new_category = _pick_bw_title(texts, rules)
             category = new_category or category
             current = BWSection(title, notes=notes, category=category)
             sections.append(current)
@@ -555,6 +682,7 @@ class OrderItem:
     planogram: str = ""
     soh: str = ""
     on_order: str = ""
+    supplier: str = ""  # from the flight file
     status: str = FAILED
     calculated: float = None  # MIN QTY 770MM + planogram - SOH - on order
     qty: float = None  # starts as calculated; the user may change it
@@ -580,7 +708,8 @@ def calculate_order(section, table, planogram_col, threshold, index=0):
         plu = row.get("PLU", "").strip()
         key = _plu_key(plu)
         item = OrderItem(
-            index, key, key if _is_number(plu) else plu or "(blank)", row.get("DESCRIPTION", "")
+            index, key, key if _is_number(plu) else plu or "(blank)", row.get("DESCRIPTION", ""),
+            supplier=re.sub(r"\s+", " ", row.get("SUPPLIER", "")).strip(),
         )
         min_header = next((h for h in row if h.startswith(MIN_QTY_PREFIX)), None)
         min_qty = _to_number(row[min_header]) if min_header else None
@@ -639,15 +768,29 @@ def calculate_orders(sections, table, planogram_col, threshold):
             found_in.setdefault(item.key, []).append(item)
     for same in found_in.values():
         for item in same:
-            others = ", ".join(sections[o.section].title for o in same if o is not item)
+            others = ", ".join(
+                split_section_title(sections[o.section].title)[0] for o in same if o is not item
+            )
             if others:
                 item.notes.append(f"also in: {others}")
     return items
 
 
-def order_lines(items, index):
-    """The (PLU, QTY) rows to write for a section."""
-    return [(i.plu, _format_qty(i.qty)) for i in items if i.section == index and i.include]
+NO_SUPPLIER_NAME = "NO SUPPLIER"
+
+
+def supplier_key(name):
+    """'Sigma ' -> 'SIGMA'; blank -> NO_SUPPLIER_NAME. For grouping items by supplier."""
+    return re.sub(r"\s+", " ", name).strip().upper() or NO_SUPPLIER_NAME
+
+
+def order_lines(items, index, supplier=None):
+    """The (PLU, QTY) rows to write for a section, or for one supplier's items in it."""
+    return [
+        (i.plu, _format_qty(i.qty)) for i in items
+        if i.section == index and i.include
+        and (supplier is None or supplier_key(i.supplier) == supplier)
+    ]
 
 
 def section_file_names(sections):
@@ -843,6 +986,13 @@ def apply_theme(root, dark=False):
     for name in ("Ok", "Warn", "Hint"):
         style.configure(f"{name}.TLabel", foreground=colors[name.lower()])
     style.configure("Step.TLabel", font=("Segoe UI", 10, "bold"), foreground=colors["step"])
+    # Text that can be clicked
+    style.configure("Link.TLabel", foreground=colors["step"])
+    style.configure("LinkHover.TLabel", foreground=colors["step"], font=("Segoe UI", 10, "underline"))
+    style.configure("WarnLink.TLabel", foreground=colors["warn"])
+    style.configure(
+        "WarnLinkHover.TLabel", foreground=colors["warn"], font=("Segoe UI", 10, "underline")
+    )
     style.configure("AppTitle.TLabel", font=("Segoe UI", 18, "bold"))
     style.configure("PageTitle.TLabel", font=("Segoe UI", 13, "bold"))
     style.configure("DialogOk.TLabel", font=("Segoe UI", 13, "bold"), foreground=colors["ok"])
@@ -940,8 +1090,20 @@ def _natural_key(text):
     ]
 
 
-def _page(parent, title, go_home, step=None):
-    """A task page: header, body that takes the spare space. Returns (frame, body)."""
+def _link(label, command, style="Link"):
+    """Make a ttk label clickable: hand cursor, underline on hover, command on click."""
+    label.configure(style=f"{style}.TLabel", cursor="hand2")
+    label.bind("<Enter>", lambda e: label.configure(style=f"{style}Hover.TLabel"))
+    label.bind("<Leave>", lambda e: label.configure(style=f"{style}.TLabel"))
+    label.bind("<Button-1>", lambda e: command())
+    return label
+
+
+def _page(parent, title, go_home, step=None, go_step=None):
+    """A task page: header, body that takes the spare space. Returns (frame, body).
+
+    go_step(i) goes to step i of BW_STEPS; earlier steps can be clicked to go back.
+    """
     from tkinter import ttk
 
     frm = ttk.Frame(parent, padding=_px(16))
@@ -953,10 +1115,13 @@ def _page(parent, title, go_home, step=None):
     ttk.Label(bar, text=title, style="PageTitle.TLabel").pack(side="left", padx=12)
     if step is not None:
         for i in reversed(range(len(BW_STEPS))):
-            ttk.Label(
+            label = ttk.Label(
                 bar, text=f"{i + 1}  {BW_STEPS[i]}",
                 style="Step.TLabel" if i == step else "Hint.TLabel",
-            ).pack(side="right")
+            )
+            label.pack(side="right")
+            if go_step and i < step:
+                _link(label, lambda i=i: go_step(i))
             if i:
                 ttk.Label(bar, text="→", style="Hint.TLabel").pack(side="right", padx=8)
     body = ttk.Frame(frm)
@@ -1145,6 +1310,232 @@ def _section_preview(root, section):
     win.minsize(_px(360), _px(240))
     win.deiconify()
     _dark_title_bar(win, root.dark)
+    tree.focus_set()
+    return win
+
+
+def _rules_dialog(root, on_saved=None):
+    """Window to edit the B&W category rules. on_saved() is called after saving."""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    rules = bw_rules()
+    data = [dict(c) for c in rules["categories"]]
+    win = tk.Toplevel(root)
+    win.withdraw()
+    win.title(f"Category rules - {APP_NAME}")
+    win.transient(root)
+    frm = ttk.Frame(win, padding=_px(16))
+    frm.pack(fill="both", expand=True)
+    frm.columnconfigure(0, weight=1)
+    frm.rowconfigure(2, weight=1)
+    ttk.Label(frm, text="Category rules", style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        frm, style="Hint.TLabel", wraplength=_px(640), justify="left",
+        text="Headings in the flight file with these names become categories, listed in "
+        "this order. 'Tick by default' says which of their sections are ticked when a file "
+        "is opened: click it to change it. Double-click a name, grade or section number to "
+        "edit it. A grade is the letter after the section number (#48D is grade D); "
+        "'Except sections' are numbers never ticked, e.g. 5.",
+    ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+
+    box = ttk.Frame(frm)
+    box.grid(row=2, column=0, sticky="nsew")
+    box.columnconfigure(0, weight=1)
+    box.rowconfigure(0, weight=1)
+    cols = (
+        ("name", "Category", 280, "w"), ("tick", "Tick by default", 150, "w"),
+        ("grades", "Only grades", 100, "center"), ("except", "Except sections", 120, "center"),
+    )
+    tree = ttk.Treeview(
+        box, columns=[c[0] for c in cols], show="headings", height=11, selectmode="browse"
+    )
+    for name, label, width, anchor in cols:
+        tree.heading(name, text=label, anchor=anchor)
+        tree.column(name, width=_px(width), anchor=anchor, stretch=name == "name")
+    tree.grid(row=0, column=0, sticky="nsew")
+    _scrollbar(tree, "vertical", 0, 1)
+    TICK_ORDER = ("all", "grades", "none")
+
+    def values(c):
+        return (
+            c["name"], "▸ " + BW_TICK_LABELS[c["tick"]],
+            c["grades"] if c["tick"] == "grades" else "",
+            c["except"] if c["tick"] != "none" else "",
+        )
+
+    def selected():
+        row = tree.focus()
+        return int(row) if row and tree.exists(row) else None
+
+    def update_buttons(*_):
+        i = selected()
+        for button, ok in (
+            (remove_btn, i is not None), (up_btn, bool(i)),
+            (down_btn, i is not None and i < len(data) - 1),
+        ):
+            button.state(["!disabled" if ok else "disabled"])
+
+    def redraw(select=None):
+        tree.delete(*tree.get_children())
+        for i, c in enumerate(data):
+            tree.insert("", "end", iid=str(i), values=values(c))
+        if select is not None and 0 <= select < len(data):
+            tree.selection_set(str(select))
+            tree.focus(str(select))
+            tree.see(str(select))
+        update_buttons()
+
+    def edited(iid, col, text):
+        if text is None or not tree.exists(iid):
+            return True
+        c = data[int(iid)]
+        if col == "name":
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                return True
+            if any(
+                _category_key(o["name"]) == _category_key(text)
+                for j, o in enumerate(data) if j != int(iid)
+            ):
+                messagebox.showerror(APP_NAME, f"'{text}' is already in the list.", parent=win)
+                return True
+        elif col == "grades":
+            text = ", ".join(dict.fromkeys(re.findall(r"[A-Z]", text.upper())))
+        elif col == "except":
+            text = ", ".join(dict.fromkeys(str(int(n)) for n in re.findall(r"\d+", text)))
+        c[col] = text
+        tree.item(iid, values=values(c))
+        return True
+
+    editor = CellEditor(tree, edited)
+
+    def column_at(x):
+        column = tree.identify_column(x)
+        return tree.column(column, "id") if column else None
+
+    def edit(row, col):
+        c = data[int(row)]
+        if (col == "grades" and c["tick"] != "grades") or (col == "except" and c["tick"] == "none"):
+            return
+        editor.open(row, col, c[col])
+
+    def on_click(event):
+        row = tree.identify_row(event.y)
+        if tree.identify_region(event.x, event.y) != "cell" or not row:
+            return None
+        editor.close()
+        tree.selection_set(row)
+        tree.focus(row)
+        if column_at(event.x) == "tick":
+            c = data[int(row)]
+            c["tick"] = TICK_ORDER[(TICK_ORDER.index(c["tick"]) + 1) % len(TICK_ORDER)]
+            tree.item(row, values=values(c))
+            if c["tick"] == "grades" and not c["grades"]:
+                edit(row, "grades")
+            return "break"
+        return None
+
+    def on_double(event):
+        row, col = tree.identify_row(event.y), column_at(event.x)
+        if row and col and col != "tick":
+            edit(row, col)
+        return "break"
+
+    tree.bind("<Button-1>", on_click)
+    tree.bind("<Double-1>", on_double)
+    tree.bind("<F2>", lambda e: selected() is not None and edit(tree.focus(), "name"))
+    tree.bind("<<TreeviewSelect>>", update_buttons)
+
+    btns = ttk.Frame(frm)
+    btns.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+    def add():
+        editor.close()
+        data.append({"name": "NEW CATEGORY", "tick": "all", "grades": "", "except": ""})
+        redraw(len(data) - 1)
+        edit(str(len(data) - 1), "name")
+
+    def remove():
+        i = selected()
+        if i is not None:
+            editor.close(False)
+            del data[i]
+            redraw(min(i, len(data) - 1))
+
+    def move(step):
+        i = selected()
+        if i is None or not 0 <= i + step < len(data):
+            return
+        editor.close()
+        data[i], data[i + step] = data[i + step], data[i]
+        redraw(i + step)
+
+    ttk.Button(btns, text="Add", command=add).pack(side="left")
+    remove_btn = ttk.Button(btns, text="Remove", command=remove)
+    remove_btn.pack(side="left", padx=(6, 0))
+    up_btn = ttk.Button(btns, text="Move up", command=lambda: move(-1))
+    up_btn.pack(side="left", padx=(6, 0))
+    down_btn = ttk.Button(btns, text="Move down", command=lambda: move(1))
+    down_btn.pack(side="left", padx=(6, 0))
+
+    skip_row = ttk.Frame(frm)
+    skip_row.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+    skip_row.columnconfigure(1, weight=1)
+    ttk.Label(skip_row, text="Never tick sections whose title starts with:").grid(
+        row=0, column=0, sticky="w"
+    )
+    skip_var = tk.StringVar(value=", ".join(rules["skip_titles"]))
+    ttk.Entry(skip_row, textvariable=skip_var).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+    ttk.Label(skip_row, text="Separate several with commas.", style="Hint.TLabel").grid(
+        row=1, column=1, sticky="w", padx=(6, 0)
+    )
+
+    def restore():
+        editor.close(False)
+        data[:] = copy.deepcopy(DEFAULT_BW_RULES["categories"])
+        skip_var.set(", ".join(DEFAULT_BW_RULES["skip_titles"]))
+        redraw()
+
+    def close():
+        win.grab_release()
+        win.destroy()
+
+    def save():
+        editor.close()
+        missing = [c["name"] for c in data if c["tick"] == "grades" and not c["grades"]]
+        if missing:
+            messagebox.showerror(
+                APP_NAME, "Choose the grades to tick for:\n" + "\n".join(missing), parent=win
+            )
+            return
+        set_setting("bw_rules", _clean_rules({
+            "categories": data, "skip_titles": skip_var.get().split(","),
+        }))
+        close()
+        if on_saved:
+            on_saved()
+
+    bar = ttk.Frame(frm)
+    bar.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+    ttk.Button(bar, text="Restore defaults", command=restore).pack(side="left")
+    ttk.Button(bar, text="Save", command=save, style="Accent.TButton").pack(side="right")
+    ttk.Button(bar, text="Cancel", command=close).pack(side="right", padx=(0, 8))
+    ttk.Label(
+        bar, text="Saving reloads the open flight file.", style="Hint.TLabel"
+    ).pack(side="right", padx=(0, 12))
+    win.bind("<Escape>", lambda e: editor.entry is None and close())
+    win.protocol("WM_DELETE_WINDOW", close)
+    redraw(0 if data else None)
+    win.update_idletasks()
+    w, h = max(win.winfo_reqwidth(), _px(720)), win.winfo_reqheight()
+    x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+    y = root.winfo_rooty() + (root.winfo_height() - h) // 3
+    win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+    win.minsize(_px(560), _px(360))
+    win.deiconify()
+    _dark_title_bar(win, root.dark)
+    win.grab_set()
     tree.focus_set()
     return win
 
@@ -1556,10 +1947,14 @@ def build_home_page(parent, root, open_page):
         def switch():
             root.dark = dark.get()
             apply_theme(root, root.dark)
+            set_setting("dark", root.dark)
 
         ttk.Checkbutton(
             page_frm, text="Dark mode", variable=dark, command=switch, style="Switch.TCheckbutton"
         ).place(relx=1, rely=1, anchor="se")
+    ttk.Label(page_frm, text=f"Version {APP_VERSION}", style="Hint.TLabel").place(
+        relx=0, rely=1, anchor="sw"
+    )
     return Page(page_frm)
 
 
@@ -1654,8 +2049,12 @@ def build_plu_page(parent, root, go_home):
         switch_mode()
 
     def browse_input():
-        path = filedialog.askopenfilename(title="Select an Excel or CSV file", filetypes=FILE_TYPES)
+        path = filedialog.askopenfilename(
+            title="Select an Excel or CSV file", filetypes=FILE_TYPES,
+            initialdir=remembered_dir("dir_plu"),
+        )
         if path:
+            set_setting("dir_plu", os.path.dirname(os.path.abspath(path)))
             use_file(path)
 
     ttk.Label(file_box, text="Input file:").grid(row=0, column=0, sticky="w")
@@ -1931,6 +2330,7 @@ def build_bw_page(parent, root, go_home, go_next):
     from tkinter import filedialog, messagebox, ttk
 
     frm, body = _page(parent, "Process B&W Flight", go_home, step=0)
+    MONTHS = list(_MONTHS.values())
     body.columnconfigure(0, weight=1)
     body.rowconfigure(3, weight=1)
 
@@ -1950,6 +2350,7 @@ def build_bw_page(parent, root, go_home, go_next):
     state = {
         "sections": [], "selected": set(), "sort": (None, False), "shown": [],
         "categories": [], "collapsed": set(),
+        "group_of": [],  # the category each section is listed under
     }
 
     # --- input file
@@ -1985,12 +2386,16 @@ def build_bw_page(parent, root, go_home, go_next):
     list_box.columnconfigure(0, weight=1)
     list_box.rowconfigure(0, weight=1)
     tree = ttk.Treeview(
-        list_box, columns=("check", "section", "supplier", "items", "preview"), height=8,
-        selectmode="none", displaycolumns=("section", "supplier", "items", "preview"),
+        list_box, columns=("check", "section", "dates", "supplier", "items", "preview"), height=8,
+        selectmode="none", displaycolumns=("section", "dates", "supplier", "items", "preview"),
     )
     _check_column(tree, root, lambda: set_all(not state["shown"] or not all_shown_selected()))
-    headings = {"section": ("Section", "w"), "supplier": ("Supplier", "w"), "items": ("Items", "center")}
-    tree.column("section", width=_px(420), minwidth=_px(120), anchor="w")
+    headings = {
+        "section": ("Section", "w"), "dates": ("Display dates", "w"),
+        "supplier": ("Supplier", "w"), "items": ("Items", "center"),
+    }
+    tree.column("section", width=_px(340), minwidth=_px(120), anchor="w")
+    tree.column("dates", width=_px(125), minwidth=_px(60), stretch=False, anchor="w")
     tree.column("supplier", width=_px(170), minwidth=_px(60), stretch=False, anchor="w")
     tree.column("items", width=_px(80), minwidth=_px(60), stretch=False, anchor="center")
     tree.column("preview", width=_px(90), minwidth=_px(70), stretch=False, anchor="center")
@@ -2004,7 +2409,14 @@ def build_bw_page(parent, root, go_home, go_next):
     root.on_theme.append(recolor)
     def category_of(idx):
         """Index into state["categories"] of the group a section is listed under."""
-        return state["categories"].index(bw_group(state["sections"][idx]))
+        return state["categories"].index(state["group_of"][idx])
+
+    def default_selection(sections, rules):
+        """The sections ticked when a file is opened: by the category rules, or all of
+        them if the file has none of the categories."""
+        if any(_known_category(s.category, rules) for s in sections):
+            return {i for i, s in enumerate(sections) if bw_default_selected(s, rules)}
+        return set(range(len(sections)))
 
     def grouped():
         return group_var.get() and any(s.category for s in state["sections"])
@@ -2036,7 +2448,7 @@ def build_bw_page(parent, root, go_home, go_next):
         arrow = "▸" if cat in state["collapsed"] else "▾"
         picked = sum(i in state["selected"] for i in ids)
         tree.item(iid, image=root.checks[box], tags=("group",), values=(
-            box, f"{arrow}  {state['categories'][cat]}", f"{picked} of {len(ids)} selected",
+            box, f"{arrow}  {state['categories'][cat]}", "", f"{picked} of {len(ids)} selected",
             sum(len(state["sections"][i].items) for i in ids), "",
         ))
 
@@ -2100,8 +2512,16 @@ def build_bw_page(parent, root, go_home, go_next):
         section = state["sections"][idx]
         if col == "items":
             return len(section.items)
-        text = section.title if col == "section" else section_supplier(section)
-        return _natural_key(text)
+        if col == "dates":
+            # By the first date: month (Oct-Dec before Jan-Sep, as flights run over
+            # the new year), then day; sections without dates last
+            found = re.match(r"(\d+) (\w{3})", split_section_title(section.title)[1])
+            if not found or found.group(2) not in MONTHS:
+                return (1, 0, 0)
+            month = (MONTHS.index(found.group(2)) - 9) % 12
+            return (0, month, int(found.group(1)))
+        name = split_section_title(section.title)[0]
+        return _natural_key(name if col == "section" else section_supplier(section))
 
     def passes_filter(section):
         supplier = supplier_var.get()
@@ -2126,7 +2546,11 @@ def build_bw_page(parent, root, go_home, go_next):
 
         def add(idx):
             s = state["sections"][idx]
-            values = ("", s.title, section_supplier(s), len(s.items), "View…")
+            name, dates = split_section_title(s.title)
+            values = (
+                "", ("⚠ " if s.notes else "") + name, dates, section_supplier(s), len(s.items),
+                "View…",
+            )
             tree.insert("", "end", iid=str(idx), values=values)
             refresh_row(idx)
 
@@ -2218,14 +2642,34 @@ def build_bw_page(parent, root, go_home, go_next):
         refresh_groups()
         update_sel_info()
 
+    def reset_ticks():
+        """Tick the sections as when the file was opened."""
+        state["selected"] = default_selection(state["sections"], bw_rules())
+        for i in range(len(state["sections"])):
+            refresh_row(i)
+        refresh_groups()
+        update_sel_info()
+
+    def open_rules():
+        def saved():
+            if in_var.get():
+                load(in_var.get())  # categories and ticks may have changed
+
+        _rules_dialog(root, saved)
+
     sel_row = ttk.Frame(body)
     sel_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
-    sel_row.columnconfigure(2, weight=1)
+    sel_row.columnconfigure(4, weight=1)
     ttk.Button(sel_row, text="Select all", command=lambda: set_all(True)).grid(row=0, column=0)
     ttk.Button(sel_row, text="Select none", command=lambda: set_all(False)).grid(
         row=0, column=1, padx=(6, 0)
     )
-    ttk.Label(sel_row, textvariable=sel_info).grid(row=0, column=2, sticky="e")
+    reset_btn = ttk.Button(sel_row, text="Reset ticks", command=reset_ticks, state="disabled")
+    reset_btn.grid(row=0, column=2, padx=(6, 0))
+    ttk.Button(sel_row, text="Category rules…", command=open_rules).grid(
+        row=0, column=3, padx=(18, 0)
+    )
+    ttk.Label(sel_row, textvariable=sel_info).grid(row=0, column=4, sticky="e")
 
     # --- loading
     def load(path):
@@ -2242,16 +2686,17 @@ def build_bw_page(parent, root, go_home, go_next):
             return
         in_var.set(os.path.normpath(path))
         _show_end(in_entry)
+        set_setting("dir_flight", os.path.dirname(os.path.abspath(path)))
+        rules = bw_rules()
         state["sections"], state["sort"] = sections, (None, False)
+        state["group_of"] = [bw_group(s, rules) for s in sections]
         # Known categories in file order, then the rest
-        groups = list(dict.fromkeys(bw_group(s) for s in sections))
+        groups = list(dict.fromkeys(state["group_of"]))
         state["categories"] = [g for g in groups if g != BW_OTHER_CATEGORIES] + [
             g for g in groups if g == BW_OTHER_CATEGORIES
         ]
-        if any(_known_category(s.category) for s in sections):
-            state["selected"] = {i for i, s in enumerate(sections) if bw_default_selected(s)}
-        else:
-            state["selected"] = set(range(len(sections)))  # no known categories: tick all
+        state["selected"] = default_selection(sections, rules)
+        reset_btn.state(["!disabled"])
         state["collapsed"] = set()
         (group_check.grid if any(s.category for s in sections) else group_check.grid_remove)()
         suppliers = {}
@@ -2265,14 +2710,17 @@ def build_bw_page(parent, root, go_home, go_next):
         found_var.set(
             f"{_plural(len(sections), 'section')} found"
             + (f" in {cats} {'category' if cats == 1 else 'categories'}" if cats else "")
-            + ". Click a section to include or leave it out, View… (or P) to see its items, "
-            "or a heading to sort:"
+            + ". Click a section to include or leave it out, View… (or P) to see its items "
+            "and notes (⚠ = has notes), or a heading to sort:"
         )
         refresh_view()
         tree.focus_set()
 
     def browse_input():
-        path = filedialog.askopenfilename(title="Select the B&W flight file", filetypes=FILE_TYPES)
+        path = filedialog.askopenfilename(
+            title="Select the B&W flight file", filetypes=FILE_TYPES,
+            initialdir=remembered_dir("dir_flight"),
+        )
         if path:
             load(path)
 
@@ -2289,7 +2737,7 @@ def build_bw_page(parent, root, go_home, go_next):
     return Page(frm, run, go_home, load)
 
 
-def build_bw_stock_page(parent, root, go_home, go_back, go_next):
+def build_bw_stock_page(parent, root, go_home, go_back, go_next, go_step=None):
     """go_next(stock table, planogram column label, threshold, stock file path) opens the
     review page.
 
@@ -2298,7 +2746,7 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    frm, body = _page(parent, "Process B&W Flight", go_home, step=1)
+    frm, body = _page(parent, "Process B&W Flight", go_home, step=1, go_step=go_step)
     body.columnconfigure(1, weight=1)
     body.rowconfigure(3, weight=1)
 
@@ -2307,7 +2755,7 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     in_var = tk.StringVar()
     stock_info = tk.StringVar()
     planogram_var = tk.StringVar()
-    threshold_var = tk.StringVar(value="0")
+    threshold_var = tk.StringVar(value=str(get_setting("threshold", "0")))
     state = {
         "file": None,  # StockTable from the chosen file
         "paste": None,  # StockTable from the pasted cells
@@ -2370,7 +2818,10 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         refresh_table()
 
     def browse_input():
-        path = filedialog.askopenfilename(title="Select the stock report", filetypes=FILE_TYPES)
+        path = filedialog.askopenfilename(
+            title="Select the stock report", filetypes=FILE_TYPES,
+            initialdir=remembered_dir("dir_stock"),
+        )
         if path:
             load(path)
 
@@ -2387,6 +2838,7 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(APP_NAME, f"Could not read the file:\n{e}")
             return
+        set_setting("dir_stock", os.path.dirname(os.path.abspath(path)))
         in_var.set(os.path.normpath(path))
         _show_end(in_entry)
         file_rows.load(rows)
@@ -2469,8 +2921,12 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
             labels = list(table.columns)
             planogram_box.configure(values=labels, state="readonly")
             if planogram_var.get() not in table.columns:
+                # The column used last time, else the only one named like a planogram
                 likely = [c for c in labels if "PLANOGRAM" in c.upper()]
-                planogram_var.set(likely[0] if len(likely) == 1 else "")
+                last = get_setting("planogram")
+                planogram_var.set(
+                    last if last in table.columns else likely[0] if len(likely) == 1 else ""
+                )
         update_ready()
 
     def update_ready(*_):
@@ -2492,6 +2948,8 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         table_of(mode.get()).finish()
         if update_ready():
             return  # the value just changed left nothing to use
+        set_setting("planogram", planogram_var.get())
+        set_setting("threshold", threshold_var.get().strip())
         go_next(
             current_table(), planogram_var.get(), _to_number(threshold_var.get()),
             in_var.get() if mode.get() == "file" else "",
@@ -2511,13 +2969,13 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     return Page(frm, run, go_back, load, start)
 
 
-def build_bw_review_page(parent, root, go_home, go_back):
+def build_bw_review_page(parent, root, go_home, go_back, go_step=None):
     """Page.start takes (flight path, sections, stock table, planogram label, threshold,
     stock file path) and returns False if the user chose to stay on the previous page."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    frm, body = _page(parent, "Process B&W Flight", go_home, step=2)
+    frm, body = _page(parent, "Process B&W Flight", go_home, step=2, go_step=go_step)
     body.columnconfigure(0, weight=1)
     body.rowconfigure(2, weight=1)
 
@@ -2536,6 +2994,9 @@ def build_bw_review_page(parent, root, go_home, go_back):
     search_var = tk.StringVar()
     section_var = tk.StringVar(value=ALL_SECTIONS)
     group_var = tk.BooleanVar(value=True)
+    split_var = tk.BooleanVar(value=bool(get_setting("split_by_supplier", False)))
+    problems_var = tk.StringVar()
+    suppliers_var = tk.StringVar()
     HINT = "Click a box to include or leave out an item. Click an order quantity to change it."
     state = {
         "flight": "", "sections": [], "inputs": None, "items": [],
@@ -2602,6 +3063,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
     def recolor(colors):
         tree.tag_configure("on", background=colors["on"])
         tree.tag_configure("off", foreground=colors["off"])
+        tree.tag_configure("failed", foreground=colors["warn"])
         tree.tag_configure("section", background=colors["section"], font=("Segoe UI", 10, "bold"))
 
     root.on_theme.append(recolor)
@@ -2612,6 +3074,22 @@ def build_bw_review_page(parent, root, go_home, go_back):
     hint_lbl = ttk.Label(info_row, textvariable=hint_var, style="Hint.TLabel")
     hint_lbl.grid(row=0, column=0, sticky="w")
     ttk.Label(info_row, textvariable=total_var).grid(row=0, column=1, sticky="e")
+    problems_lbl = _link(
+        ttk.Label(info_row, textvariable=problems_var), lambda: show_filter("failed"), "WarnLink"
+    )
+    problems_lbl.grid(row=1, column=0, sticky="w", pady=(2, 0))
+    ttk.Label(info_row, textvariable=suppliers_var, style="Hint.TLabel").grid(
+        row=1, column=1, sticky="e", pady=(2, 0)
+    )
+
+    def show_filter(name):
+        search_var.set("")
+        section_var.set(ALL_SECTIONS)
+        filter_var.set(name)
+        refresh()
+
+    def short_title(section):
+        return split_section_title(state["sections"][section].title)[0]
 
     def hint(text="", warn=False):
         hint_var.set(text or HINT)
@@ -2625,7 +3103,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
         indent = "      " if group_var.get() else ""
         return (
             CHECKED if item.include else UNCHECKED, indent + _one_line(item.description),
-            state["sections"][item.section].title, item.plu, item.min_qty, item.planogram, item.soh,
+            short_title(item.section), item.plu, item.min_qty, item.planogram, item.soh,
             item.on_order,
             "" if item.qty is None else _format_qty(item.qty), "; ".join(notes),
         )
@@ -2634,10 +3112,8 @@ def build_bw_review_page(parent, root, go_home, go_back):
         item = state["items"][idx]
         if tree.exists(str(idx)):
             box = CHECKED if item.include else BLOCKED if item.qty is None else UNCHECKED
-            tree.item(
-                str(idx), values=row_values(item), image=root.checks[box],
-                tags=("on" if item.include else "off",),
-            )
+            tag = "on" if item.include else "failed" if item.status == FAILED else "off"
+            tree.item(str(idx), values=row_values(item), image=root.checks[box], tags=(tag,))
 
     def refresh_row(idx):
         draw_row(idx)
@@ -2671,9 +3147,11 @@ def build_bw_review_page(parent, root, go_home, go_back):
         items = [i for i in state["items"] if i.section == section]
         arrow = "▸" if section in state["collapsed"] else "▾"
         values = dict.fromkeys((c[0] for c in columns), "")
+        name, dates = split_section_title(state["sections"][section].title)
         values.update(
-            check=box, desc=f"{arrow}  {state['sections'][section].title}",
-            note=f"{sum(i.include for i in items)} of {len(items)} to order",
+            check=box, desc=f"{arrow}  {name}",
+            note=f"{sum(i.include for i in items)} of {len(items)} to order"
+            + (f"   ·   {dates}" if dates else ""),
         )
         tree.item(
             iid, values=list(values.values()), image=root.checks[box], tags=("section",)
@@ -2685,8 +3163,21 @@ def build_bw_review_page(parent, root, go_home, go_back):
             filter_btns[name].configure(text=f"{label} ({sum(1 for i in items if test(i))})")
         tree.heading("#0", image=root.heading_checks[box_state(state["shown"])])
         chosen = [i for i in items if i.include]
-        files = len({i.section for i in chosen})
+        if split_var.get():
+            files = len({(i.section, supplier_key(i.supplier)) for i in chosen})
+        else:
+            files = len({i.section for i in chosen})
         hidden = sum(1 for i in chosen if not found(i))
+        problems = sum(1 for i in items if i.status == FAILED and not i.include)
+        problems_var.set(
+            f"⚠ {_plural(problems, 'item')} couldn't be calculated. Show them" if problems else ""
+        )
+        by_supplier = {}
+        for i in chosen:
+            by_supplier[supplier_key(i.supplier)] = by_supplier.get(supplier_key(i.supplier), 0) + 1
+        suppliers_var.set("  ·  ".join(
+            f"{name} {n}" for name, n in sorted(by_supplier.items(), key=lambda x: -x[1])
+        ))
         total_var.set(
             f"{_plural(len(chosen), 'item')} to order in {_plural(files, 'file')}"
             + (f", including {hidden} hidden by the search" if hidden else "")
@@ -2723,7 +3214,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
                 }[col]
                 return _to_number(text) if text.strip() else None
             return _natural_key({
-                "desc": item.description, "section": sections[item.section].title,
+                "desc": item.description, "section": short_title(item.section),
                 "plu": item.plu, "note": row_values(item)[-1],
             }[col]) or None
 
@@ -2887,7 +3378,24 @@ def build_bw_review_page(parent, root, go_home, go_back):
         )
         if path:
             out_var.set(os.path.normpath(path))
+            set_setting("order_folder", out_var.get())
             _show_end(out_entry)
+
+    def default_output():
+        set_setting("order_folder", None)
+        out_var.set(os.path.normpath(default_order_folder(state["flight"])))
+        _show_end(out_entry)
+
+    def split_changed():
+        set_setting("split_by_supplier", split_var.get())
+        out_hint.configure(text=OUT_HINTS[split_var.get()])
+        update_totals()
+
+    OUT_HINTS = {
+        False: "Each section is saved as its own CSV in this folder.",
+        True: "Each section is saved as one CSV per supplier, e.g. "
+              "'#1 P&G ... - WAREHOUSE.csv', in this folder.",
+    }
 
     out_row = ttk.Frame(body)
     out_row.grid(row=4, column=0, sticky="ew", pady=(12, 0))
@@ -2898,9 +3406,12 @@ def build_bw_review_page(parent, root, go_home, go_back):
     # Keep the folder name (end of a long path) visible once the page is laid out
     out_entry.bind("<Configure>", lambda e: _show_end(out_entry))
     ttk.Button(out_row, text="Browse…", command=browse_output).grid(row=0, column=2)
-    ttk.Label(
-        out_row, text="Each section is saved as its own CSV in this folder.", style="Hint.TLabel"
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    ttk.Button(out_row, text="Default", command=default_output).grid(row=0, column=3, padx=(6, 0))
+    out_hint = ttk.Label(out_row, text=OUT_HINTS[split_var.get()], style="Hint.TLabel")
+    out_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    ttk.Checkbutton(
+        out_row, text="One file per supplier", variable=split_var, command=split_changed
+    ).grid(row=1, column=2, columnspan=2, sticky="e", pady=(4, 0))
 
     # --- action + result
     def show_details():
@@ -2922,11 +3433,19 @@ def build_bw_review_page(parent, root, go_home, go_back):
         if not any(i.include for i in items):
             return  # the edit just finished left nothing to order
         folder = out_var.get().strip()
-        lines = [order_lines(items, i) for i in range(len(sections))]
-        paths = [os.path.join(folder, name) for name in section_file_names(sections)]
-        todo = [(path, rows) for path, rows in zip(paths, lines) if rows]
-        # Files from an earlier run for sections that now have nothing to order
-        stale = [p for p, rows in zip(paths, lines) if not rows and os.path.exists(p)]
+        jobs = []  # (path, rows) for every file the sections could have
+        for i, name in enumerate(section_file_names(sections)):
+            if split_var.get():
+                base = name[: -len(".csv")]
+                suppliers = dict.fromkeys(supplier_key(it.supplier) for it in items if it.section == i)
+                for sup in suppliers:
+                    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", sup)
+                    jobs.append((os.path.join(folder, f"{base} - {safe}.csv"), order_lines(items, i, sup)))
+            else:
+                jobs.append((os.path.join(folder, name), order_lines(items, i)))
+        todo = [(path, rows) for path, rows in jobs if rows]
+        # Files from an earlier run that now have nothing to order
+        stale = [p for p, rows in jobs if not rows and os.path.exists(p)]
 
         def full(path):
             return os.path.normcase(os.path.abspath(path))
@@ -2977,7 +3496,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
         message = folder
         if parts:
             message += f"\n\nItems: {', '.join(parts)}."
-        empty = sum(not rows for rows in lines)
+        empty = sum(not order_lines(items, i) for i in range(len(sections)))
         if empty:
             message += f"\n\n{_plural(empty, 'section')} had nothing to order, so no file was made."
 
@@ -2986,7 +3505,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
 
         if stale:
             message += (
-                "\n\nOlder files for sections with nothing to order are still in the folder:\n"
+                "\n\nOlder files with nothing to order now are still in the folder:\n"
                 + listed([os.path.basename(p) for p in stale])
             )
         if failed:
@@ -3022,7 +3541,8 @@ def build_bw_review_page(parent, root, go_home, go_back):
         ):
             return False
         if flight != state["flight"]:
-            out_var.set(os.path.normpath(default_order_folder(flight)))
+            # The folder chosen last time, else one named after the flight file
+            out_var.set(remembered_dir("order_folder") or os.path.normpath(default_order_folder(flight)))
         state.update(
             flight=flight, sections=sections, inputs=new,
             items=calculate_orders(sections, table, table.columns[planogram], threshold),
@@ -3032,7 +3552,8 @@ def build_bw_review_page(parent, root, go_home, go_back):
         titles = []
         for s in sections:
             same = sum(1 for other in sections[: len(titles)] if other.title == s.title)
-            titles.append(f"{s.title} ({same + 1})" if same else s.title)
+            name = split_section_title(s.title)[0]
+            titles.append(f"{name} ({same + 1})" if same else name)
         section_box.configure(values=(ALL_SECTIONS, *titles))
         section_var.set(ALL_SECTIONS)
         search_var.set("")
@@ -3068,13 +3589,13 @@ def run_gui():
 
     root = tk.Tk()
     root.withdraw()  # until it is laid out
-    root.title(APP_NAME)
+    root.title(f"{APP_NAME}  {APP_VERSION}")
     set_window_icon(root)
 
     global _scale
     _scale = root.winfo_fpixels("1i") / 96
-    root.on_theme, root.dark = [], False
-    apply_theme(root)
+    root.on_theme, root.dark = [], bool(get_setting("dark", False))
+    apply_theme(root, root.dark)
 
     container = ttk.Frame(root)
     container.pack(fill="both", expand=True)
@@ -3116,10 +3637,17 @@ def run_gui():
     pages["home"] = build_home_page(container, root, show)
     pages["plu"] = build_plu_page(container, root, go_home)
     pages["bw"] = build_bw_page(container, root, go_home, open_stock)
+    steps = ("bw", "bw_stock", "bw_review")  # the pages of BW_STEPS
+
+    def go_step(i):
+        show(steps[i])
+
     pages["bw_stock"] = build_bw_stock_page(
-        container, root, go_home, lambda: show("bw"), open_review
+        container, root, go_home, lambda: show("bw"), open_review, go_step
     )
-    pages["bw_review"] = build_bw_review_page(container, root, go_home, lambda: show("bw_stock"))
+    pages["bw_review"] = build_bw_review_page(
+        container, root, go_home, lambda: show("bw_stock"), go_step
+    )
 
     def on_return(event):
         kind = event.widget.winfo_class()
@@ -3138,7 +3666,7 @@ def run_gui():
     root.bind("<Return>", on_return)
     root.bind("<Escape>", on_escape)
     show("home")
-    apply_theme(root)  # again, for the widgets made since
+    apply_theme(root, root.dark)  # again, for the widgets made since
 
     # One size for all pages, so the buttons stay put when moving between them
     root.update_idletasks()
