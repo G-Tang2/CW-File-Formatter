@@ -17,10 +17,14 @@ Process B&W Flight
   Reads a B&W flight workbook (.xlsx or .csv) and lists its sections, e.g.
   "HEALTHY BREAK 24A BANANA BOAT", so the user can pick which to process (all
   are selected to begin with).
-  A section starts at a row whose first filled cell is text (the section
-  title); a 'MYCHEM ID' row gives the column headers (a section without its
-  own header row reuses the previous one); rows starting with a number are
-  the section's items.
+  A section starts at the text rows above its items: the last one that isn't
+  a note ('*WA stores need to ...') is the section title, notes are kept, and a
+  short heading before it ('GONDOLA ENDS') is the category for it and the
+  sections after it; a
+  row of column headings, in any order and starting in any column (e.g.
+  'MYCHEM ID | PLU | ...' or 'PAGE NO | PLU | ...'), gives the column headers
+  (a section without its own header row reuses the previous one); rows with a
+  number in the PLU (or MYCHEM ID) column are the section's items.
 
   The next page takes a stock report (.xlsx/.csv file or pasted cells) with PLU
   and SOH columns plus a planogram column the user picks. Items are matched on
@@ -210,45 +214,220 @@ BW_DEFAULT_HEADERS = [
 class BWSection:
     title: str
     items: list = field(default_factory=list)  # one {header: value} dict per item row
+    notes: list = field(default_factory=list)  # note rows above the items, e.g. '*WA stores ...'
+    category: str = ""  # heading the section is under, e.g. 'GONDOLA ENDS'
+
+
+# Other spellings of headers, by their normalised form. DESCRIPTION is what the
+# review page shows as the item name.
+BW_HEADER_ALIASES = {
+    "MYCHEMID": BW_ID_HEADER, "MY CHEM ID": BW_ID_HEADER,
+    "PRODUCT DESCRIPTION": "DESCRIPTION", "ITEM DESCRIPTION": "DESCRIPTION",
+    "PRODUCT NAME": "DESCRIPTION", "ITEM NAME": "DESCRIPTION",
+}
+# Words that make a cell look like a column heading rather than a title or a value
+BW_HEADER_WORDS = re.compile(
+    r"\b(PLU|MY ?CHEM ?ID|SKU|APN|BARCODE|DESCRIPTION|PRODUCT|ITEM|NAME|BRAND|SUPPLIER|"
+    r"SUPPLIED|VENDOR|RE-?ORDER|ORDERS?|QTY|QUANTITY|MIN|MAX|PAGE|NO|CODE|PRICE|RRP|"
+    r"COST|SAVING|COMMENTS?|NOTES?|SOH|STOCK|PLANOGRAM|CATEGORY|SIZE)\b"
+)
 
 
 def _norm_header(text):
-    """'PLU:' -> 'PLU', ' mychem id ' -> 'MYCHEM ID'."""
-    return re.sub(r"\s+", " ", str(text)).strip().rstrip(":").strip().upper()
+    """'PLU:' -> 'PLU', ' mychem id ' -> 'MYCHEM ID', 'Product Description' -> 'DESCRIPTION'."""
+    name = re.sub(r"\s+", " ", str(text)).strip().rstrip(":").strip().upper()
+    return BW_HEADER_ALIASES.get(name, name)
+
+
+def _looks_like_header(name):
+    """Whether a normalised cell reads like a column heading: short, no figures."""
+    return (
+        len(name) <= 40 and not re.search(r"\d{3,}|\$\s*\d", name)
+        and BW_HEADER_WORDS.search(name) is not None
+    )
+
+
+def _bw_headers(cells, next_cells=None):
+    """[(column index, header name)] if the row is a header row, else None.
+
+    The headings can be in any order and start in any column. A row counts if
+      - two or more of its cells read like headings (PLU, SUPPLIER, MIN QTY ...), or
+      - it has a PLU or MYCHEM ID heading and another cell, or
+      - it has three or more text cells and the next row (next_cells) has a
+        number in one of those columns, so it reads like headings over items.
+    """
+    headers = [(i, _norm_header(c)) for i, c in enumerate(cells) if c]
+    if len(headers) < 2 or any(_is_number(c) for _, c in headers):
+        return None
+    names = {name for _, name in headers}
+    if names & {TARGET_HEADER, BW_ID_HEADER}:
+        return headers
+    if sum(_looks_like_header(name) for _, name in headers) >= 2:
+        return headers
+    if len(headers) >= 3 and next_cells and any(
+        _is_number(_cell(next_cells, i)) for i, _ in headers
+    ):
+        return headers
+    return None
+
+
+def _bw_key_columns(headers):
+    """Columns that hold a number on every item row: PLU and MYCHEM ID."""
+    return [i for i, name in headers or () if name in (TARGET_HEADER, BW_ID_HEADER)]
 
 
 def _is_number(text):
     return re.fullmatch(r"\d+(\.0+)?", text) is not None
 
 
+# Text rows that are notes to the reader, not section titles
+BW_NOTE_START = re.compile(r"^\s*(\*|N\.?B\b|NOTE\b|PLEASE\b|IMPORTANT\b)", re.IGNORECASE)
+BW_NOTE_WORDS = re.compile(r"\b(NEEDS? TO|MUST|SHOULD|PLEASE)\b", re.IGNORECASE)
+
+
+def _is_bw_note(text):
+    """Whether a text row reads like a note ('*WA and SA stores need to order ...')
+    rather than a section title ('#1 P&G: ORAL B & VOOST END')."""
+    text = text.strip()
+    return bool(
+        BW_NOTE_START.search(text) or BW_NOTE_WORDS.search(text) or text.endswith((".", "!"))
+    )
+
+
+# Category headings in B&W flight files, in the order they are listed. Other headings
+# that read like categories are grouped under BW_OTHER_CATEGORIES.
+BW_CATEGORIES = [
+    "GONDOLA ENDS", "MESH ENDS", "TILL MESH", "SCRIPTS MESH", "FLOOR STANDS", "MEZZANINE",
+    "FRAGRANCE PODIUM", "WOITW", "P&G SCRIPTS IN PODS 1-12", "OPELLA SCRIPTS OUT PODS 1-12",
+]
+BW_OTHER_CATEGORIES = "Other categories"
+# Which sections are ticked when a file is opened, by category:
+BW_SELECT_ALL = {"GONDOLA ENDS", "MESH ENDS", "TILL MESH", "SCRIPTS MESH", "FRAGRANCE PODIUM"}
+BW_SKIP_NUMBERS = {"TILL MESH": {5}}  # ...except these section numbers ('#5 ...')
+BW_SELECT_GRADES = {"WOITW": {"D"}}  # ...and these grades ('#48D ...' is grade D)
+BW_SKIP_TITLES = ("SELECTED STORES",)  # sections whose title starts so are never ticked
+
+
+def _category_key(text):
+    """'Gondola  Ends:' -> 'GONDOLA ENDS', for comparing headings with BW_CATEGORIES."""
+    return re.sub(r"\s+", " ", re.sub(r"[:.\s]+$", "", str(text))).strip().upper()
+
+
+_BW_CATEGORY_KEYS = {_category_key(c): c for c in BW_CATEGORIES}
+
+
+def _known_category(text):
+    """The BW_CATEGORIES name a heading is, or None."""
+    return _BW_CATEGORY_KEYS.get(_category_key(text))
+
+
+def bw_group(section):
+    """The category a section is listed under: one of BW_CATEGORIES or BW_OTHER_CATEGORIES."""
+    return _known_category(section.category) or BW_OTHER_CATEGORIES
+
+
+def _section_number_grade(title):
+    """('48', 'D') for '#48D CWH: WAGNER ...', (None, None) if it has no '#' number."""
+    found = re.match(r"\s*#\s*(\d+)([A-Z])?(?![A-Z])", title, re.IGNORECASE)
+    if not found:
+        return None, None
+    return found.group(1), (found.group(2) or "").upper() or None
+
+
+def bw_default_selected(section):
+    """Whether a section is ticked when the file is opened (see BW_SELECT_ALL)."""
+    if section.title.strip().upper().startswith(BW_SKIP_TITLES):
+        return False
+    group = bw_group(section)
+    number, grade = _section_number_grade(section.title)
+    if group in BW_SELECT_ALL:
+        return not (number and int(number) in BW_SKIP_NUMBERS.get(group, ()))
+    if group in BW_SELECT_GRADES:
+        return grade in BW_SELECT_GRADES[group]
+    return False
+
+
+def _is_bw_category(text):
+    """Whether a text row reads like a category heading ('GONDOLA ENDS', 'MESH ENDS'):
+    a few words with no figures, unlike section titles ('#1 P&G: ORAL B END ...')."""
+    return (
+        not _is_bw_note(text) and not re.search(r"[\d#]", text)
+        and len(text.split()) <= 5 and len(text) <= 40
+    )
+
+
+def _pick_bw_title(texts):
+    """(title, notes, category) from the text rows above a section's items, given as
+    (text, above a header row).
+
+    The title is the last row that isn't a note; if every row reads like a note, the
+    last row is used. The category is the last category-like row before the title
+    ('' if none). A heading from BW_CATEGORIES wins over other category-like rows and
+    counts even above a header row ('WOITW'); other rows above a header row are
+    banners ('COMPLIANCE ENDS DECEMBER CATALOGUE'), not categories.
+    """
+    plain = [t for t, _ in texts if not _is_bw_note(t)]
+    title = (plain or [t for t, _ in texts])[-1]
+    at = next(i for i in reversed(range(len(texts))) if texts[i][0] is title)
+    notes = [t for t, _ in texts if t is not title and _is_bw_note(t)]
+    if _known_category(title):
+        return title, notes, _known_category(title)  # a category with no section title
+    # Headings from BW_CATEGORIES count wherever they are; other category-like rows
+    # only if they are not banners
+    known = [_known_category(t) for t, _ in texts[:at] if _known_category(t)]
+    if known:
+        return title, notes, known[-1]
+    others = [t for t, banner in texts[:at] if not banner and _is_bw_category(t)]
+    return title, notes, others[-1] if others else ""
+
+
 def parse_bw_sections(rows):
-    """Split B&W flight rows into sections. Sections with no items are left out."""
+    """Split B&W flight rows into sections. Sections with no items are left out.
+
+    Item rows are told apart from text rows by a number in the PLU or MYCHEM ID
+    column, or, before any header row is known (or if it has neither), by a number in
+    the first filled cell. The text rows just above a section's items give its title,
+    notes and category (see _pick_bw_title); a category carries on to the sections
+    after it until the next one.
+    """
     sections = []
     current = None
-    headers = None  # [(column index, header name)] from the latest 'MYCHEM ID' row
+    category = ""
+    headers = None  # [(column index, header name)] from the latest header row
+    texts = []  # (text, above a header row) for the text rows since the last item
+    rows = [[str(c).strip() for c in row] for row in rows]
+    rows = [r for r in rows if any(r)]  # leave out blank (or colour-only) rows
 
-    for row in rows:
-        cells = [str(c).strip() for c in row]
-        first = next((i for i, c in enumerate(cells) if c), None)
-        if first is None:
-            continue  # blank (or colour-only) row
+    for n, cells in enumerate(rows):
+        first = next(i for i, c in enumerate(cells) if c)
         lead = cells[first]
+        keys = _bw_key_columns(headers)
+        if keys:
+            is_item = any(_is_number(_cell(cells, i)) for i in keys)
+        else:
+            is_item = _is_number(lead)
 
-        if _norm_header(lead) == BW_ID_HEADER:
-            headers = [(i, _norm_header(c)) for i, c in enumerate(cells) if c]
+        if not is_item:
+            row_headers = _bw_headers(cells, rows[n + 1] if n + 1 < len(rows) else None)
+            if row_headers:
+                headers = row_headers
+                texts = [(t, True) for t, _ in texts]
+            else:
+                texts.append((re.sub(r"\s+", " ", lead).strip(), False))
             continue
 
-        if not _is_number(lead):
-            current = BWSection(re.sub(r"\s+", " ", lead).strip())
+        if texts:
+            title, notes, new_category = _pick_bw_title(texts)
+            category = new_category or category
+            current = BWSection(title, notes=notes, category=category)
             sections.append(current)
-            continue
-
+            texts = []
         if current is None:
             continue  # items before any section title: nothing to file them under
         cols = headers or list(enumerate(BW_DEFAULT_HEADERS, start=first))
         current.items.append({name: _cell(cells, i) for i, name in cols})
 
-    return [s for s in sections if s.items]
+    return sections
 
 
 def load_bw_sections(path):
@@ -256,21 +435,25 @@ def load_bw_sections(path):
     if not sections:
         raise ExtractError(
             "No sections found in this file.\n\nExpected section title rows (e.g. "
-            "'HEALTHY BREAK 24A BANANA BOAT') followed by rows starting with a MYCHEM ID."
+            "'HEALTHY BREAK 24A BANANA BOAT') followed by rows starting with a MYCHEM ID "
+            "or PLU."
         )
     return sections
 
 
-def section_supplier(section):
-    """The supplier shared by all of the section's items, or 'Mix' if there are several."""
+def section_suppliers(section):
+    """The different suppliers of the section's items, in the order they first appear."""
     names = {}
     for item in section.items:
         name = re.sub(r"\s+", " ", item.get("SUPPLIER", "")).strip()
         if name:
             names.setdefault(name.upper(), name)
-    if len(names) > 1:
-        return "Mix"
-    return next(iter(names.values()), "")
+    return list(names.values())
+
+
+def section_supplier(section):
+    """The section's suppliers as one line, e.g. 'DIRECT, SIGMA'."""
+    return ", ".join(section_suppliers(section))
 
 
 # ---------------------------------------------------------------- B&W order
@@ -876,6 +1059,79 @@ def _result_dialog(root, title, message, buttons=(), warn=False):
     _dark_title_bar(win, root.dark)
     win.grab_set()
     close.focus_set()
+    return win
+
+
+def _section_preview(root, section):
+    """Window listing a B&W section's items, read only. Several can be open at once."""
+    import tkinter as tk
+    from tkinter import font, ttk
+
+    # Columns in the order they first appear, leaving out ones with nothing in them
+    names = []
+    for item in section.items:
+        names += [n for n in item if n not in names]
+    names = [n for n in names if any(str(i.get(n, "")).strip() for i in section.items)]
+
+    win = tk.Toplevel(root)
+    win.withdraw()
+    win.title(f"{section.title} - {APP_NAME}")
+    win.transient(root)
+    frm = ttk.Frame(win, padding=_px(16))
+    frm.pack(fill="both", expand=True)
+    frm.columnconfigure(0, weight=1)
+    frm.rowconfigure(3, weight=1)
+    ttk.Label(frm, text=section.title, style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
+    supplier = section_supplier(section)
+    ttk.Label(
+        frm, style="Hint.TLabel",
+        text=(f"{section.category}  ·  " if section.category else "")
+        + _plural(len(section.items), "item") + (f"  ·  Supplier: {supplier}" if supplier else ""),
+    ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+    if section.notes:
+        ttk.Label(
+            frm, text="\n".join(section.notes), style="Hint.TLabel", wraplength=_px(700),
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 10))
+
+    box = ttk.Frame(frm)
+    box.grid(row=3, column=0, sticky="nsew")
+    box.columnconfigure(0, weight=1)
+    box.rowconfigure(0, weight=1)
+    cols = [f"c{i}" for i in range(len(names))]
+    tree = ttk.Treeview(box, columns=cols, show="headings", height=14, selectmode="extended")
+    tree.grid(row=0, column=0, sticky="nsew")
+    _scrollbar(tree, "vertical", 0, 1)
+    _scrollbar(tree, "horizontal", 1, 0)
+    rows = [[_one_line(item.get(n, "")) for n in names] for item in section.items]
+    measure = font.nametofont("TkDefaultFont").measure
+    for i, name in enumerate(names):
+        widest = max([r[i] for r in rows], key=len, default="")
+        width = max(measure(name), measure(widest)) + _px(24)
+        numeric = all(_is_number(r[i]) for r in rows if r[i])
+        tree.column(
+            cols[i], width=min(max(width, _px(50)), _px(360)), minwidth=_px(30),
+            stretch=False, anchor="e" if numeric else "w",
+        )
+        tree.heading(cols[i], text=name, anchor="w")
+    for r in rows:
+        tree.insert("", "end", values=r)
+
+    close = ttk.Button(frm, text="Close", command=win.destroy, style="Accent.TButton")
+    close.grid(row=4, column=0, sticky="e", pady=(12, 0))
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.bind("<Return>", lambda e: win.destroy())
+
+    win.update_idletasks()
+    w = min(max(win.winfo_reqwidth(), _px(480)), round(root.winfo_screenwidth() * 0.9))
+    h = min(win.winfo_reqheight(), round(root.winfo_screenheight() * 0.85))
+    x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+    y = root.winfo_rooty() + (root.winfo_height() - h) // 3
+    win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+    win.minsize(_px(360), _px(240))
+    win.deiconify()
+    _dark_title_bar(win, root.dark)
+    tree.focus_set()
     return win
 
 
@@ -1673,9 +1929,14 @@ def build_bw_page(parent, root, go_home, go_next):
     sel_info = tk.StringVar()
     search_var = tk.StringVar()
     supplier_var = tk.StringVar(value=ALL_SUPPLIERS)
+    group_var = tk.BooleanVar(value=True)
     # selected holds indexes into sections; sort is (column or None, descending);
-    # shown lists the indexes that pass the filter, in display order
-    state = {"sections": [], "selected": set(), "sort": (None, False), "shown": []}
+    # shown lists the indexes that pass the filter, in display order; categories lists
+    # the category names in file order and collapsed the indexes of the folded ones
+    state = {
+        "sections": [], "selected": set(), "sort": (None, False), "shown": [],
+        "categories": [], "collapsed": set(),
+    }
 
     # --- input file
     file_row = ttk.Frame(body)
@@ -1700,29 +1961,75 @@ def build_bw_page(parent, root, go_home, go_next):
         filter_row, textvariable=supplier_var, state="readonly", width=24, values=(ALL_SUPPLIERS,)
     )
     supplier_box.grid(row=0, column=3, padx=(6, 0))
+    group_check = ttk.Checkbutton(
+        filter_row, text="Group by category", variable=group_var, command=lambda: refresh_view()
+    )
+    group_check.grid(row=0, column=4, padx=(12, 0))
 
     list_box = ttk.Frame(body)
     list_box.grid(row=3, column=0, sticky="nsew")
     list_box.columnconfigure(0, weight=1)
     list_box.rowconfigure(0, weight=1)
     tree = ttk.Treeview(
-        list_box, columns=("check", "section", "supplier", "items"), height=8, selectmode="none",
-        displaycolumns=("section", "supplier", "items"),
+        list_box, columns=("check", "section", "supplier", "items", "preview"), height=8,
+        selectmode="none", displaycolumns=("section", "supplier", "items", "preview"),
     )
     _check_column(tree, root, lambda: set_all(not state["shown"] or not all_shown_selected()))
     headings = {"section": ("Section", "w"), "supplier": ("Supplier", "w"), "items": ("Items", "center")}
     tree.column("section", width=_px(420), minwidth=_px(120), anchor="w")
     tree.column("supplier", width=_px(170), minwidth=_px(60), stretch=False, anchor="w")
     tree.column("items", width=_px(80), minwidth=_px(60), stretch=False, anchor="center")
+    tree.column("preview", width=_px(90), minwidth=_px(70), stretch=False, anchor="center")
+    tree.heading("preview", text="Preview", anchor="center")
     tree.grid(row=0, column=0, sticky="nsew")
     _scrollbar(tree, "vertical", 0, 1)
-    root.on_theme.append(lambda colors: tree.tag_configure("on", background=colors["on"]))
+    def recolor(colors):
+        tree.tag_configure("on", background=colors["on"])
+        tree.tag_configure("group", background=colors["section"], font=("Segoe UI", 10, "bold"))
+
+    root.on_theme.append(recolor)
+    def category_of(idx):
+        """Index into state["categories"] of the group a section is listed under."""
+        return state["categories"].index(bw_group(state["sections"][idx]))
+
+    def grouped():
+        return group_var.get() and any(s.category for s in state["sections"])
+
+    def group_ids(cat):
+        """A category's shown sections."""
+        return [i for i in state["shown"] if category_of(i) == cat]
+
+    def box_state(ids):
+        on = sum(i in state["selected"] for i in ids)
+        if not ids:
+            return BLOCKED
+        return CHECKED if on == len(ids) else PARTLY if on else UNCHECKED
 
     def refresh_row(idx):
+        if not tree.exists(str(idx)):
+            return
         on = idx in state["selected"]
         box = CHECKED if on else UNCHECKED
         tree.set(str(idx), "check", box)
         tree.item(str(idx), image=root.checks[box], tags=("on",) if on else ())
+
+    def refresh_group(cat):
+        iid = f"c{cat}"
+        if not tree.exists(iid):
+            return
+        ids = group_ids(cat)
+        box = box_state(ids)
+        arrow = "▸" if cat in state["collapsed"] else "▾"
+        picked = sum(i in state["selected"] for i in ids)
+        tree.item(iid, image=root.checks[box], tags=("group",), values=(
+            box, f"{arrow}  {state['categories'][cat]}", f"{picked} of {len(ids)} selected",
+            sum(len(state["sections"][i].items) for i in ids), "",
+        ))
+
+    def refresh_groups(ids=None):
+        cats = range(len(state["categories"])) if ids is None else {category_of(i) for i in ids}
+        for cat in cats:
+            refresh_group(cat)
 
     def all_shown_selected():
         return state["selected"].issuperset(state["shown"])
@@ -1750,10 +2057,30 @@ def build_bw_page(parent, root, go_home, go_next):
         )
         set_reason("" if sel else "Select at least one section")
 
-    def toggle(idx):
-        state["selected"].symmetric_difference_update({idx})
-        refresh_row(idx)
+    def toggle_ids(ids):
+        """Tick the sections, or clear them if they are all ticked already."""
+        on = not state["selected"].issuperset(ids)
+        (state["selected"].update if on else state["selected"].difference_update)(ids)
+        for i in ids:
+            refresh_row(i)
+        refresh_groups(ids)
         update_sel_info()
+
+    def toggle(idx):
+        toggle_ids([idx])
+
+    def toggle_group(cat):
+        toggle_ids(group_ids(cat))
+
+    def fold(cat, open_it=None):
+        """Fold a category's sections away or show them again (open_it: force either)."""
+        folded = cat in state["collapsed"]
+        if open_it is not None and open_it != folded:
+            return  # already open, or already folded
+        state["collapsed"].symmetric_difference_update({cat})
+        refresh_view()
+        tree.focus(f"c{cat}")
+        tree.see(f"c{cat}")
 
     def sort_key(col, idx):
         section = state["sections"][idx]
@@ -1764,20 +2091,46 @@ def build_bw_page(parent, root, go_home, go_next):
 
     def passes_filter(section):
         supplier = supplier_var.get()
-        if supplier != ALL_SUPPLIERS and supplier.upper() != (
-            section_supplier(section) or NO_SUPPLIER
-        ).upper():
+        # A section with several suppliers shows under each of them
+        if supplier != ALL_SUPPLIERS and supplier.upper() not in {
+            s.upper() for s in section_suppliers(section) or [NO_SUPPLIER]
+        }:
             return False
-        return all(word in section.title.upper() for word in search_var.get().upper().split())
+        text = f"{section.title} {section.category}".upper()
+        return all(word in text for word in search_var.get().upper().split())
 
     def refresh_view(*_):
-        """List the sections that pass the filter, in the chosen order (default: as in the file)."""
+        """List the sections that pass the filter, in the chosen order (default: as in the
+        file), under their categories if grouped."""
         col, descending = state["sort"]
         order = [i for i, s in enumerate(state["sections"]) if passes_filter(s)]
         if col:
             order.sort(key=lambda i: sort_key(col, i), reverse=descending)
         state["shown"] = order
-        tree.set_children("", *map(str, order))
+        focus = tree.focus()
+        tree.delete(*tree.get_children())
+
+        def add(idx):
+            s = state["sections"][idx]
+            values = ("", s.title, section_supplier(s), len(s.items), "View…")
+            tree.insert("", "end", iid=str(idx), values=values)
+            refresh_row(idx)
+
+        if grouped():
+            members = {}
+            for idx in order:
+                members.setdefault(category_of(idx), []).append(idx)
+            for cat in sorted(members):
+                tree.insert("", "end", iid=f"c{cat}")
+                refresh_group(cat)
+                if cat not in state["collapsed"]:
+                    for idx in members[cat]:
+                        add(idx)
+        else:
+            for idx in order:
+                add(idx)
+        if focus and tree.exists(focus):
+            tree.focus(focus)
         for name, (label, anchor) in headings.items():
             arrow = (" ▼" if descending else " ▲") if name == col else ""
             tree.heading(name, text=label + arrow, anchor=anchor)
@@ -1791,6 +2144,13 @@ def build_bw_page(parent, root, go_home, go_next):
     for name in headings:
         tree.heading(name, command=lambda c=name: sort_by(c))
 
+    def column_at(x):
+        column = tree.identify_column(x)
+        return tree.column(column, "id") if column not in ("", "#0") else column
+
+    def preview(idx):
+        _section_preview(root, state["sections"][idx])
+
     def on_click(event):
         if tree.identify_region(event.x, event.y) == "heading":
             return None  # let the heading handle it (sorts the list)
@@ -1798,23 +2158,50 @@ def build_bw_page(parent, root, go_home, go_next):
         if row and tree.identify_region(event.x, event.y) in ("cell", "tree"):
             tree.focus(row)
             tree.focus_set()
-            toggle(int(row))
+            column = column_at(event.x)
+            if row.startswith("c"):
+                # Category row: its tick box ticks all its sections, elsewhere folds it
+                (toggle_group if column == "#0" else fold)(int(row[1:]))
+            else:
+                (preview if column == "preview" else toggle)(int(row))
         return "break"
 
-    def on_space(_):
-        row = tree.focus()
-        if row and int(row) in state["shown"]:
-            toggle(int(row))
-        return "break"
+    def on_motion(event):
+        # After _check_column's handler, which clears the cursor elsewhere
+        row = tree.identify_row(event.y)
+        if row and not row.startswith("c") and column_at(event.x) == "preview":
+            tree.configure(cursor="hand2")
+
+    def on_key(section_action=None, group_action=None):
+        """Key handler that runs the action for the focused section or category row.
+        Keys with no action for that kind of row keep their usual meaning."""
+        def handler(_):
+            row = tree.focus()
+            if row.startswith("c"):
+                if not group_action:
+                    return None
+                group_action(int(row[1:]))
+            elif row and int(row) in state["shown"]:
+                if not section_action:
+                    return None
+                section_action(int(row))
+            return "break"
+        return handler
 
     tree.bind("<Button-1>", on_click)
-    tree.bind("<space>", on_space)
+    tree.bind("<space>", on_key(toggle, toggle_group))
+    tree.bind("<Motion>", on_motion, add="+")
+    for key in ("p", "P"):
+        tree.bind(f"<KeyPress-{key}>", on_key(preview, lambda c: None))
+    tree.bind("<Left>", on_key(group_action=lambda c: fold(c, open_it=False)))
+    tree.bind("<Right>", on_key(group_action=lambda c: fold(c, open_it=True)))
 
     def set_all(on):
         """Select or clear the sections that are showing."""
         (state["selected"].update if on else state["selected"].difference_update)(state["shown"])
         for i in state["shown"]:
             refresh_row(i)
+        refresh_groups()
         update_sel_info()
 
     sel_row = ttk.Frame(body)
@@ -1841,22 +2228,31 @@ def build_bw_page(parent, root, go_home, go_next):
             return
         in_var.set(os.path.normpath(path))
         _show_end(in_entry)
-        # Rows hidden by the filter are still items of the tree, so clear by id
-        tree.delete(*(str(i) for i in range(len(state["sections"]))))
         state["sections"], state["sort"] = sections, (None, False)
-        state["selected"] = set(range(len(sections)))
+        # Known categories in file order, then the rest
+        groups = list(dict.fromkeys(bw_group(s) for s in sections))
+        state["categories"] = [g for g in groups if g != BW_OTHER_CATEGORIES] + [
+            g for g in groups if g == BW_OTHER_CATEGORIES
+        ]
+        if any(_known_category(s.category) for s in sections):
+            state["selected"] = {i for i, s in enumerate(sections) if bw_default_selected(s)}
+        else:
+            state["selected"] = set(range(len(sections)))  # no known categories: tick all
+        state["collapsed"] = set()
+        (group_check.grid if any(s.category for s in sections) else group_check.grid_remove)()
         suppliers = {}
-        for i, s in enumerate(sections):
-            supplier = section_supplier(s)
-            tree.insert("", "end", iid=str(i), values=("", s.title, supplier, len(s.items)))
-            refresh_row(i)
-            suppliers.setdefault((supplier or NO_SUPPLIER).upper(), supplier or NO_SUPPLIER)
+        for s in sections:
+            for supplier in section_suppliers(s) or [NO_SUPPLIER]:
+                suppliers.setdefault(supplier.upper(), supplier)
         supplier_box.configure(values=(ALL_SUPPLIERS, *(suppliers[k] for k in sorted(suppliers))))
         search_var.set("")
         supplier_var.set(ALL_SUPPLIERS)
+        cats = len([g for g in state["categories"] if g != BW_OTHER_CATEGORIES])
         found_var.set(
-            f"{_plural(len(sections), 'section')} found. "
-            "Click a section to include or leave it out, or a heading to sort:"
+            f"{_plural(len(sections), 'section')} found"
+            + (f" in {cats} {'category' if cats == 1 else 'categories'}" if cats else "")
+            + ". Click a section to include or leave it out, View… (or P) to see its items, "
+            "or a heading to sort:"
         )
         refresh_view()
         tree.focus_set()
@@ -1874,6 +2270,7 @@ def build_bw_page(parent, root, go_home, go_next):
     )
     for var in (search_var, supplier_var):
         var.trace_add("write", refresh_view)
+    group_check.grid_remove()  # until a file with categories is loaded
     refresh_view()
     return Page(frm, run, go_home, load)
 
