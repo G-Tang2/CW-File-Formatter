@@ -29,7 +29,8 @@ Process B&W Flight
   The next page takes a stock report (.xlsx/.csv file or pasted cells) with PLU
   and SOH columns plus a planogram column the user picks. Items are matched on
   PLU and written to a two-column CSV (PLU, QTY), no header row, when
-      QTY = MIN QTY 770MM + Planogram - SOH  is at least the threshold.
+      QTY = MIN QTY 770MM + Planogram - SOH - On Order  is at least the threshold
+  (On Order only if the stock report has that column; blank counts as 0).
   A review page lists the items, where they can be left out and their quantities
   changed. Each selected section gets its own CSV, named after the section.
 
@@ -458,6 +459,7 @@ def section_supplier(section):
 
 # ---------------------------------------------------------------- B&W order
 SOH_HEADER = "SOH"
+ON_ORDER_HEADER = "ON ORDER"  # optional stock report column
 MIN_QTY_PREFIX = "MIN QTY 770"  # matches 'MIN QTY 770M' and 'MIN QTY 770MM'
 
 
@@ -493,6 +495,7 @@ class StockTable:
     rows: dict  # {PLU key: row}
     conflicts: set = field(default_factory=set)  # PLU keys on several rows that differ
     body: list = field(default_factory=list)  # [(index into the rows parsed, row)], every item row
+    on_order_col: int = None  # the On Order column, if the report has one
 
 
 def parse_stock_rows(rows, source="file"):
@@ -512,16 +515,19 @@ def parse_stock_rows(rows, source="file"):
         )
 
     plu_col, soh_col = names.index(TARGET_HEADER), names.index(SOH_HEADER)
+    # 'On Order', 'ON-ORDER', 'OnOrder' ...
+    on_order = [i for i, n in enumerate(names) if re.sub(r"[\s\-_]", "", n) == "ONORDER"]
+    on_order_col = on_order[0] if on_order else None
     columns = {}
     for ci, cell in enumerate(row):
         label = re.sub(r"\s+", " ", cell)
-        if not label or ci in (plu_col, soh_col):
+        if not label or ci in (plu_col, soh_col, on_order_col):
             continue
         if label in columns:
             label = f"{label} (column {ci + 1})"
         columns[label] = ci
 
-    table = StockTable(plu_col, soh_col, columns, {})
+    table = StockTable(plu_col, soh_col, columns, {}, on_order_col=on_order_col)
     for i, row in enumerate(rows[ri + 1:], start=ri + 1):
         key = _plu_key(_cell(row, plu_col))
         if not key or key == TARGET_HEADER:
@@ -548,8 +554,9 @@ class OrderItem:
     min_qty: str = ""  # these three are display text
     planogram: str = ""
     soh: str = ""
+    on_order: str = ""
     status: str = FAILED
-    calculated: float = None  # MIN QTY 770MM + planogram - SOH
+    calculated: float = None  # MIN QTY 770MM + planogram - SOH - on order
     qty: float = None  # starts as calculated; the user may change it
     include: bool = False  # goes into the order file
     notes: list = field(default_factory=list)
@@ -560,8 +567,9 @@ class OrderItem:
 
 
 def calculate_order(section, table, planogram_col, threshold, index=0):
-    """OrderItems for a section: QTY = MIN QTY 770MM + planogram - SOH, ordered when
-    QTY >= threshold.
+    """OrderItems for a section: QTY = MIN QTY 770MM + planogram - SOH - on order,
+    ordered when QTY >= threshold. On order counts as 0 when the stock report has no
+    On Order column or the cell is blank.
 
     A PLU listed more than once in the section is ordered once: its MIN QTYs are
     added together so that the planogram and SOH are only counted once.
@@ -598,16 +606,21 @@ def calculate_order(section, table, planogram_col, threshold, index=0):
         row = table.rows[key]
         item.min_qty = _format_qty(min_qty)
         item.soh, item.planogram = _cell(row, table.soh_col), _cell(row, planogram_col)
+        if table.on_order_col is not None:
+            item.on_order = _cell(row, table.on_order_col)
         soh, planogram = _to_number(item.soh), _to_number(item.planogram)
-        if soh is None or planogram is None:
-            item.notes.append(f"{'SOH' if soh is None else 'planogram'} is not a number")
+        on_order = _to_number(item.on_order)  # blank is 0
+        bad = [n for n, v in (("SOH", soh), ("planogram", planogram), ("On Order", on_order))
+               if v is None]
+        if bad:
+            item.notes.append(f"{' and '.join(bad)} {'is' if len(bad) == 1 else 'are'} not a number")
             continue
         if times > 1:
             item.notes.append(f"listed {times} times in the section; MIN QTYs added together")
         if key in table.conflicts:
             item.notes.append("on several differing stock report rows; the first was used")
         # Rounding hides float noise such as 0.30000000000000004
-        item.calculated = item.qty = round(min_qty + planogram - soh, 6)
+        item.calculated = item.qty = round(min_qty + planogram - soh - on_order, 6)
         item.status = ORDER if item.qty >= threshold else NOT_NEEDED
         item.include = item.status == ORDER
     return items
@@ -618,7 +631,8 @@ def calculate_orders(sections, table, planogram_col, threshold):
     items = []
     for i, section in enumerate(sections):
         items += calculate_order(section, table, planogram_col, threshold, i)
-    # The same planogram and SOH are used for every section a PLU is in: point that out.
+    # The same planogram, SOH and on order are used for every section a PLU is in:
+    # point that out.
     found_in = {}  # PLU key -> its items in the different sections
     for item in items:
         if item.status != FAILED:
@@ -2329,6 +2343,8 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
         if table is None:
             return _raw_table(table_of(which).rows)
         cols = {table.plu_col: TARGET_HEADER, table.soh_col: SOH_HEADER}
+        if table.on_order_col is not None:
+            cols[table.on_order_col] = "On Order"
         cols.update((ci, label) for label, ci in table.columns.items())
         order = sorted(cols)
         return [cols[c] for c in order], [i for i, _ in table.body], order
@@ -2430,10 +2446,9 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
     ttk.Spinbox(body, textvariable=threshold_var, from_=-99999, to=99999, increment=1, width=8).grid(
         row=8, column=1, sticky="w", padx=6, pady=(8, 0)
     )
-    ttk.Label(
-        body, text="An item is ordered when  MIN QTY 770MM + Planogram − SOH  ≥  threshold.",
-        style="Hint.TLabel",
-    ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    FORMULA = "An item is ordered when  MIN QTY 770MM + Planogram − SOH − On Order  ≥  threshold."
+    formula_lbl = ttk.Label(body, text=FORMULA, style="Hint.TLabel")
+    formula_lbl.grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def refresh_table():
         """Show the current stock report's item count and its columns to pick from."""
@@ -2447,6 +2462,10 @@ def build_bw_stock_page(parent, root, go_home, go_back, go_next):
             planogram_var.set("")
         else:
             stock_info.set(f"{_plural(len(table.rows), 'item')} found in the stock report.")
+            formula_lbl.configure(text=FORMULA + (
+                "" if table.on_order_col is not None
+                else "  (No On Order column in this report, so it counts as 0.)"
+            ))
             labels = list(table.columns)
             planogram_box.configure(values=labels, state="readonly")
             if planogram_var.get() not in table.columns:
@@ -2563,6 +2582,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
         ("desc", "Item", 270, "w"), ("section", "Section", 160, "w"),
         ("plu", "PLU", 75, "w"), ("min", "MIN QTY", 80, "center"),
         ("plano", "Planogram", 90, "center"), ("soh", "SOH", 60, "center"),
+        ("onorder", "On Order", 75, "center"),
         ("qty", "Order", 70, "center"), ("note", "Notes", 240, "w"),
     )
     tree = ttk.Treeview(
@@ -2606,6 +2626,7 @@ def build_bw_review_page(parent, root, go_home, go_back):
         return (
             CHECKED if item.include else UNCHECKED, indent + _one_line(item.description),
             state["sections"][item.section].title, item.plu, item.min_qty, item.planogram, item.soh,
+            item.on_order,
             "" if item.qty is None else _format_qty(item.qty), "; ".join(notes),
         )
 
@@ -2695,8 +2716,11 @@ def build_bw_review_page(parent, root, go_home, go_back):
             item = items[idx]
             if col == "qty":
                 return item.qty
-            if col in ("min", "plano", "soh"):
-                text = {"min": item.min_qty, "plano": item.planogram, "soh": item.soh}[col]
+            if col in ("min", "plano", "soh", "onorder"):
+                text = {
+                    "min": item.min_qty, "plano": item.planogram, "soh": item.soh,
+                    "onorder": item.on_order,
+                }[col]
                 return _to_number(text) if text.strip() else None
             return _natural_key({
                 "desc": item.description, "section": sections[item.section].title,
